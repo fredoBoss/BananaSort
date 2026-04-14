@@ -1,0 +1,17 @@
+{
+  "serial_port": "COM9",
+  "baud_rate": 115200,
+  "db_host": "localhost",
+  "db_user": "root",
+  "db_password": "Password1",
+  "db_name": "grade",
+  "camera_index": 0,
+  "camera_width": 320,
+  "camera_height": 320,
+  "yolo_finger_model": "weights/count2.pt",
+  "yolo_size_model": "weights/size.pt",
+  "min_confidence": 0.45,
+  "max_zoom": 2.0,
+  "default_zoom": 1.0,
+  "motor_timeout": 10
+}
