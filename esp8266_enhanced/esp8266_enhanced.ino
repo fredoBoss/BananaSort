@@ -1,4 +1,4 @@
-// esp8266_enhanced.ino
+// esp8266_enhanced.ino latest functional code
 // Enhanced ESP8266 code for banana sorter weight node
 // Changes vs original:
 //   • Dynamic BASE_TARE_WEIGHT stored in EEPROM (set via serial command "settare")

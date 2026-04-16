@@ -76,7 +76,7 @@ class Config:
     WEIGHT_TIMEOUT_S    = 20
     MIN_VALID_WEIGHT_G  = 80.0
     MAX_VALID_WEIGHT_G  = 1500.0
-    WEIGHT_SETTLE_S     = 2.5
+    WEIGHT_SETTLE_S     = 1.0   # plate is already stopped at scale — settles faster
 
     W_25BCP_MIN  = 621;  W_25BCP_MAX  = 730
     W_30BCP_MIN  = 521;  W_30BCP_MAX  = 620
@@ -89,12 +89,10 @@ class Config:
     FIREBASE_TIMEOUT_S = 5
     FIREBASE_RETRY     = 3
 
-    ARDUINO_PORT    = "COM5"
-    ARDUINO_BAUD    = 115200
-    MOTOR_TIMEOUT_S = 25
-    SORT_TIMEOUT_S  = 50     # enough for bin 6 (5 clicks)
-
-    CLASSIFY_COOLDOWN_S = 0.2
+    ARDUINO_PORT      = "COM5"
+    ARDUINO_BAUD      = 115200
+    SCALE_TIMEOUT_S   = 60    # max wait for next SCALE_STOP event
+    CLASSIFY_COOLDOWN_S = 0.1
 
 
 # ─────────────────────────────────────────────────────
@@ -118,7 +116,7 @@ def getWeightFromFirebase() -> float:
     for attempt in range(Config.FIREBASE_RETRY):
         try:
             r = requests.get(f"{Config.FIREBASE_URL}/Weight.json",
-                             timeout=Config.FIREBASE_TIMEOUT_S)
+                            timeout=Config.FIREBASE_TIMEOUT_S)
             if r.status_code == 200 and r.json() is not None:
                 w = float(r.json())
                 if Config.MIN_VALID_WEIGHT_G <= w <= Config.MAX_VALID_WEIGHT_G:
@@ -402,62 +400,119 @@ class VideoThread(QThread):
 
 
 # ─────────────────────────────────────────────────────
-# SERIAL HELPERS
+# SERIAL READER THREAD
+#
+# Reads every line from Arduino and routes it:
+#   "SCALE_STOP"      → sets scale_event (wakes PipelineThread)
+#   "PLATE_IN_BIN:N"  → emits plate_sorted_signal for UI update
+#   everything else   → printed for debug
+#
+# Keeps serial reading off the pipeline thread so classify work
+# (Firebase polling, YOLO) never blocks incoming Arduino messages.
 # ─────────────────────────────────────────────────────
-def waitForToken(serial_obj, token: str, timeout: float) -> bool:
-    """
-    Read serial lines until `token` is found or timeout.
-    All other lines are printed but discarded.
-    Single-thread — no passthrough needed.
-    """
-    start = time.time()
-    while time.time() - start < timeout:
-        if serial_obj.in_waiting > 0:
+class SerialReaderThread(QThread):
+    plate_sorted_signal = pyqtSignal(int)   # bin number
+
+    def __init__(self, serial_comm):
+        super().__init__()
+        self.serial_comm  = serial_comm
+        self.running      = True
+        self.scale_event  = threading.Event()  # set when SCALE_STOP arrives
+
+    def run(self):
+        while self.running:
             try:
-                line = serial_obj.readline().decode('utf-8',
-                                                    errors='replace').rstrip()
+                if self.serial_comm.in_waiting > 0:
+                    raw  = self.serial_comm.readline()
+                    line = raw.decode('utf-8', errors='replace').rstrip()
+                    if not line:
+                        continue
+                    if line.startswith("BIN_CLICK:"):
+                        # BIN_CLICK:N,count:C,need:R  — pretty-print click progress
+                        try:
+                            parts   = line[len("BIN_CLICK:"):].split(",")
+                            bin_n   = parts[0]
+                            count   = parts[1].split(":")[1]
+                            need    = parts[2].split(":")[1]
+                            bar     = "#" * int(count) + "-" * (int(need) - int(count))
+                            print(f"  [bin {bin_n} click] {count}/{need}  [{bar}]")
+                        except Exception:
+                            print(f"  [serial rx] '{line}'")
+                        continue
+
+                    print(f"  [serial rx] '{line}'")
+
+                    if line == "SCALE_STOP":
+                        self.scale_event.set()
+
+                    elif line.startswith("PLATE_IN_BIN:"):
+                        try:
+                            bin_num = int(line.split(":")[1])
+                            self.plate_sorted_signal.emit(bin_num)
+                        except ValueError:
+                            pass
+
+                    # ASSIGNED:N and WARN/debug lines just print (already logged)
+
             except Exception as e:
-                print(f"  [serial err] {e}"); continue
-            print(f"  [serial rx] '{line}'")
-            if line == token:
-                return True
-        time.sleep(0.02)
-    print(f"  ✗ Timeout waiting for {token}")
-    return False
+                print(f"  [serial reader err] {e}")
+            self.msleep(20)
+        print("SerialReaderThread stopped")
+
+    def stop(self):
+        self.running = False
+        self.wait()
 
 
 # ─────────────────────────────────────────────────────
 # PIPELINE THREAD
 #
-# Single thread does everything sequentially:
+# Circular conveyor flow — one iteration per plate:
 #
-#  ① send "next:"       → belt rotates plate to camera
-#  ② wait CAM_STOP      → plate at camera, motor free
-#  ③ weigh + YOLO       → classify → assign bin
-#  ④ send "trayPos:N"   → Arduino starts sort (motor ON, counting clicks)
-#  ⑤ wait SORT_DONE     → sort complete, motor free
-#  ⑥ emit signals       → UI updates
-#  ⑦ loop to ①
+#  ① wait SCALE_STOP   → Arduino stopped motor, plate at scale
+#  ② settle + weigh    → Firebase (plate is stationary = fast convergence)
+#  ③ YOLO              → camera shot while plate is still stopped
+#  ④ classify          → finger count + weight → grade → bin N
+#  ⑤ save DB
+#  ⑥ send assign:N     → Arduino restarts motor immediately
+#  ⑦ emit classified   → UI table row added
+#  ⑧ loop to ①         (sort confirmation arrives async via sorted_signal)
 #
-# This is sequential because the belt motor and sort motor
-# are the SAME physical motor — they cannot run simultaneously.
+# Motor is NOT stopped for sorting — the conveyor keeps running and
+# the plate falls into its bin automatically when it passes the open
+# servo gate.  "sorted_signal" fires when Arduino sends PLATE_IN_BIN:N.
 # ─────────────────────────────────────────────────────
 class PipelineThread(QThread):
     classified_signal = pyqtSignal(dict)
-    sorted_signal     = pyqtSignal(dict)
+    sorted_signal     = pyqtSignal(dict)   # fired by _on_plate_sorted
     error_signal      = pyqtSignal(str)
 
-    def __init__(self, ard, video_thread, farm: str):
+    def __init__(self, ard, video_thread, farm: str, serial_reader):
         super().__init__()
-        self.arduino      = ard
-        self.video_thread = video_thread
-        self.farm         = farm
-        self.running      = True
-        self._paused      = False
-        self._plate_num   = 0
+        self.arduino       = ard
+        self.video_thread  = video_thread
+        self.farm          = farm
+        self.serial_reader = serial_reader
+        self.running       = True
+        self._paused       = False
+        self._plate_num    = 0
+        # FIFO list per bin — multiple plates can share the same bin.
+        # The oldest (first) entry is always the plate currently in transit
+        # for that bin (plates maintain their order on the conveyor).
+        self._active_jobs: dict[int, list] = {}   # bin_num → [job, ...]
 
     def pause(self):  self._paused = True
     def resume(self): self._paused = False
+
+    def on_plate_sorted(self, bin_num: int):
+        """Called from SerialReaderThread signal when PLATE_IN_BIN:N arrives."""
+        queue = self._active_jobs.get(bin_num, [])
+        if queue:
+            job = queue.pop(0)   # FIFO — oldest assignment first
+            if not queue:
+                del self._active_jobs[bin_num]
+            print(f"  ✓ PLATE_IN_BIN:{bin_num}  plate#{job['plate']} sorted")
+            self.sorted_signal.emit(job)
 
     def run(self):
         while self.running:
@@ -478,34 +533,40 @@ class PipelineThread(QThread):
         print(f"  PLATE #{p}")
         print(f"{'═'*50}")
 
-        # ── ① ROTATE BELT → bring plate to camera ───────────────
-        print(f"  [1] Sending next: (plate#{p})")
-        self.arduino.reqRotateNext()
-
-        print(f"  [1] Waiting CAM_STOP…")
-        ok = waitForToken(
-            self.arduino.serialComm, "CAM_STOP",
-            timeout=Config.MOTOR_TIMEOUT_S)
-        if not ok:
-            self.error_signal.emit(f"Belt timeout plate#{p}")
+        # ── ① WAIT FOR SCALE_STOP ────────────────────────────────
+        # Arduino fires this automatically when a plate arrives at the
+        # weighing station and stops the motor.
+        print(f"  [1] Waiting for plate at scale…")
+        self.serial_reader.scale_event.clear()
+        arrived = self.serial_reader.scale_event.wait(
+            timeout=Config.SCALE_TIMEOUT_S)
+        if not arrived:
+            self.error_signal.emit(f"Scale timeout plate#{p}")
             return
-        print(f"  [1] ✓ Plate at camera")
+        print(f"  [1] ✓ Plate at scale (motor stopped by Arduino)")
 
-        # ── ② WEIGH (Firebase — no serial) ──────────────────────
+        # ── ② WEIGH (Firebase) ───────────────────────────────────
+        # Plate is stationary — weight converges quickly.
         time.sleep(Config.WEIGHT_SETTLE_S)
-
         print(f"  [2] Weighing…")
         weight, ok = waitForStableWeight()
         if not ok or weight <= 0:
+            # Weight failed — skip plate, restart motor
+            print(f"  [2] ✗ Weight fail — skipping plate#{p}")
+            self.arduino.sendAssign(0)
             self.error_signal.emit(f"Weight fail plate#{p}")
             return
         print(f"  [2] ✓ {weight:.1f}g")
 
-        # ── ③ YOLO (camera — no serial) ─────────────────────────
+        # ── ③ YOLO (camera) ──────────────────────────────────────
+        # Camera is at the scale station, plate is stationary = clean shot.
         print(f"  [3] YOLO…")
         det    = captureImage(self.video_thread.get_latest_frame)
-        finger = det["finger"][1]; conf = det["finger"][0]
+        finger = det["finger"][1]
+        conf   = det["finger"][0]
         if finger == "invalid":
+            print(f"  [3] ✗ YOLO fail — skipping plate#{p}")
+            self.arduino.sendAssign(0)
             self.error_signal.emit(f"YOLO fail plate#{p}")
             return
         print(f"  [3] ✓ {finger}  conf:{conf:.2f}")
@@ -517,6 +578,8 @@ class PipelineThread(QThread):
         print(f"  [4] ✓ {banana_cls.value}  {hand.value}  → bin:{bin_num}")
 
         if banana_cls == BananaClass.UNKNOWN or bin_num is None:
+            print(f"  [4] Unknown class — skipping plate#{p}")
+            self.arduino.sendAssign(0)
             self.error_signal.emit(f"Unknown class plate#{p}")
             return
 
@@ -525,31 +588,23 @@ class PipelineThread(QThread):
                        hand.value, conf,
                        det["x1"], det["y1"], det["x2"], det["y2"])
 
-        # ── ⑥ BUILD JOB + EMIT CLASSIFIED ──────────────────────
+        # ── ⑥ BUILD JOB + SEND ASSIGN ───────────────────────────
         job = {"plate": p, "bin": bin_num, "cls": banana_cls.value,
                "weight": weight, "finger": finger, "size": hand.value,
                "img": det.get("image_path", ""), "farm": self.farm}
+
+        if bin_num not in self._active_jobs:   # store for when PLATE_IN_BIN arrives
+            self._active_jobs[bin_num] = []
+        self._active_jobs[bin_num].append(job)
+
+        self.arduino.sendAssign(bin_num)   # Arduino restarts motor immediately
+        print(f"  [5] ✓ assign:{bin_num} sent — motor restarted by Arduino")
+
+        # ── ⑦ EMIT CLASSIFIED → UI row ──────────────────────────
         self.classified_signal.emit(job)
 
-        # ── ⑦ SORT — send trayPos:N and WAIT for SORT_DONE ─────
-        print(f"  [5] Sending trayPos:{bin_num} (plate#{p})")
-        self.arduino._trayPos(bin_num)
-
-        print(f"  [5] Waiting SORT_DONE…")
-        ok = waitForToken(
-            self.arduino.serialComm, "SORT_DONE",
-            timeout=Config.SORT_TIMEOUT_S)
-        if not ok:
-            self.error_signal.emit(f"Sort timeout plate#{p} bin:{bin_num}")
-            # Still emit sorted so UI doesn't get stuck
-            self.sorted_signal.emit(job)
-            return
-        print(f"  [5] ✓ SORT_DONE plate#{p} → bin:{bin_num}")
-
-        self.sorted_signal.emit(job)
         time.sleep(Config.CLASSIFY_COOLDOWN_S)
-
-        # ── ⑧ Loop back to ① — motor is now free for belt ──────
+        # ── ⑧ Loop back to ① — sort happens automatically ────────
 
     def stop(self): self.running = False; self.wait()
 
@@ -571,6 +626,7 @@ class MainWindow(QWidget):
 
         self.video_thread    = None
         self.pipeline_thread = None
+        self.serial_reader   = None
 
         self.ui.btnStart.clicked.connect(self.onStart)
         self.ui.btnStop.clicked.connect(self.onStop)
@@ -600,14 +656,32 @@ class MainWindow(QWidget):
 
         farm = self.ui.cBoxFarm.currentText()
 
+        # ── Serial reader (must start first — pipeline waits on its event) ──
+        self.serial_reader = SerialReaderThread(arduino.serialComm)
+        self.serial_reader.start()
+
+        # ── Kick the motor so a plate advances to the scale ─────────────
+        # The scale switch will stop the motor automatically; the pipeline
+        # then wakes up on the resulting SCALE_STOP event.
+        try:
+            arduino.writeSerial("next:")
+            print("Motor started — waiting for first plate at scale…")
+        except Exception as e:
+            print(f"  [motor start failed] {e}")
+
         self.video_thread = VideoThread(cam)
         self.video_thread.frame_signal.connect(self._showFrame)
         self.video_thread.error_signal.connect(lambda m: showMsg("Video", m))
 
-        self.pipeline_thread = PipelineThread(arduino, self.video_thread, farm)
+        self.pipeline_thread = PipelineThread(
+            arduino, self.video_thread, farm, self.serial_reader)
         self.pipeline_thread.classified_signal.connect(self._onClassified)
         self.pipeline_thread.sorted_signal.connect(self._onSorted)
         self.pipeline_thread.error_signal.connect(self._onError)
+
+        # Wire PLATE_IN_BIN events to pipeline so sorted_signal fires
+        self.serial_reader.plate_sorted_signal.connect(
+            self.pipeline_thread.on_plate_sorted)
 
         self.video_thread.start()
         self.pipeline_thread.start()
@@ -620,9 +694,16 @@ class MainWindow(QWidget):
 
     def onStop(self):
         global cam
-        for t in (self.pipeline_thread, self.video_thread):
+        # Stop threads first so no more serial writes race with motorStop:
+        for t in (self.pipeline_thread, self.video_thread, self.serial_reader):
             if t: t.stop()
-        self.pipeline_thread = self.video_thread = None
+        self.pipeline_thread = self.video_thread = self.serial_reader = None
+        # Stop the motor and clear Arduino job state
+        if arduino:
+            try:
+                arduino.writeSerial("motorStop:")
+            except Exception as e:
+                print(f"  [motorStop send failed] {e}")
         if cam and cam.isOpened(): cam.release(); cam = None
         self.ui.btnStart.setEnabled(True)
         self.ui.cBoxFarm.setEnabled(True)

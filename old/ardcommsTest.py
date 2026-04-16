@@ -168,6 +168,21 @@ class arduinoCommunication:
             print(f"Stop motor failed: {e}")
             raise
 
+    def sendAssign(self, bin_num: int):
+        """
+        Send assign:N to Arduino after classifying a plate.
+        bin_num = 1–6 → sort to that bin.
+        bin_num = 0   → no banana detected, skip plate (motor restarts).
+        Arduino responds with ASSIGNED:N or ASSIGNED:skip.
+        """
+        try:
+            self.writeSerial(f"assign:{bin_num}")
+            print(f"Sent assign:{bin_num}")
+        except Exception as e:
+            print(f"assign:{bin_num} failed: {e}")
+            raise
+
+    # ── Legacy methods kept for backward compatibility ────────────────
     def servoRotate1(self): self._trayPos(1)
     def servoRotate2(self): self._trayPos(2)
     def servoRotate3(self): self._trayPos(3)
