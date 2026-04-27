@@ -1,7 +1,7 @@
 # Banana Sorting Machine — Progress & Technical Reference
 
 **Project:** Capstone — Automated banana grading and physical sorting system  
-**Last reviewed:** 2026-04-16
+**Last reviewed:** 2026-04-17
 
 ---
 
