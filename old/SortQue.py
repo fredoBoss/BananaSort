@@ -161,13 +161,20 @@ def waitForStableWeight() -> tuple:
 # ─────────────────────────────────────────────────────
 # DATABASE
 # ─────────────────────────────────────────────────────
-db = mysql.connector.connect(
-    host="localhost", user="root",
-    password="Password1", database="grade"
-)
-print("Database: OK")
+try:
+    db = mysql.connector.connect(
+        host="localhost", user="root",
+        password="Password1", database="grade"
+    )
+    print("Database: OK")
+except mysql.connector.Error as e:
+    print(f"Database: connection failed — {e}")
+    db = None
 
 def saveToDatabase(farm, cls, weight, finger, size, conf, x1, y1, x2, y2):
+    if db is None:
+        print("  ✗ DB: not connected, skipping save")
+        return
     try:
         cur = db.cursor()
         cur.execute(
@@ -234,7 +241,7 @@ class BananaClass(Enum):
     C30TR   = "30TR"
     CF36TR  = "IF36TR"
     CIF38TR = "IF38TR"
-    UNKNOWN = "unknown"
+    UNKNOWN = "Invalid Classes"
 
 CLASS_TO_BIN = {
     BananaClass.C33BCP:  1,
@@ -500,19 +507,23 @@ class PipelineThread(QThread):
         # The oldest (first) entry is always the plate currently in transit
         # for that bin (plates maintain their order on the conveyor).
         self._active_jobs: dict[int, list] = {}   # bin_num → [job, ...]
+        self._jobs_lock    = threading.Lock()
 
     def pause(self):  self._paused = True
     def resume(self): self._paused = False
 
     def on_plate_sorted(self, bin_num: int):
         """Called from SerialReaderThread signal when PLATE_IN_BIN:N arrives."""
-        queue = self._active_jobs.get(bin_num, [])
-        if queue:
-            job = queue.pop(0)   # FIFO — oldest assignment first
-            if not queue:
+        with self._jobs_lock:
+            pending = self._active_jobs.get(bin_num, [])
+            if not pending:
+                print(f"  [warn] PLATE_IN_BIN:{bin_num} but no job queued for that bin")
+                return
+            job = pending.pop(0)   # FIFO — oldest assignment first
+            if not pending:
                 del self._active_jobs[bin_num]
-            print(f"  ✓ PLATE_IN_BIN:{bin_num}  plate#{job['plate']} sorted")
-            self.sorted_signal.emit(job)
+        print(f"  ✓ PLATE_IN_BIN:{bin_num}  plate#{job['plate']} sorted")
+        self.sorted_signal.emit(job)
 
     def run(self):
         while self.running:
@@ -536,12 +547,15 @@ class PipelineThread(QThread):
         # ── ① WAIT FOR SCALE_STOP ────────────────────────────────
         # Arduino fires this automatically when a plate arrives at the
         # weighing station and stops the motor.
+        # scale_event was already cleared just before the previous sendAssign,
+        # so any SCALE_STOP that arrived after the motor restarted is preserved.
         print(f"  [1] Waiting for plate at scale…")
-        self.serial_reader.scale_event.clear()
         arrived = self.serial_reader.scale_event.wait(
             timeout=Config.SCALE_TIMEOUT_S)
         if not arrived:
             self.error_signal.emit(f"Scale timeout plate#{p}")
+            # Clear before restarting so the next plate's SCALE_STOP isn't missed
+            self.serial_reader.scale_event.clear()
             return
         print(f"  [1] ✓ Plate at scale (motor stopped by Arduino)")
 
@@ -553,6 +567,7 @@ class PipelineThread(QThread):
         if not ok or weight <= 0:
             # Weight failed — skip plate, restart motor
             print(f"  [2] ✗ Weight fail — skipping plate#{p}")
+            self.serial_reader.scale_event.clear()
             self.arduino.sendAssign(0)
             self.error_signal.emit(f"Weight fail plate#{p}")
             return
@@ -566,6 +581,7 @@ class PipelineThread(QThread):
         conf   = det["finger"][0]
         if finger == "invalid":
             print(f"  [3] ✗ YOLO fail — skipping plate#{p}")
+            self.serial_reader.scale_event.clear()
             self.arduino.sendAssign(0)
             self.error_signal.emit(f"YOLO fail plate#{p}")
             return
@@ -578,9 +594,14 @@ class PipelineThread(QThread):
         print(f"  [4] ✓ {banana_cls.value}  {hand.value}  → bin:{bin_num}")
 
         if banana_cls == BananaClass.UNKNOWN or bin_num is None:
-            print(f"  [4] Unknown class — skipping plate#{p}")
+            print(f"  [4] Invalid Classes — skipping plate#{p}")
+            self.serial_reader.scale_event.clear()
             self.arduino.sendAssign(0)
-            self.error_signal.emit(f"Unknown class plate#{p}")
+            job = {"plate": p, "bin": 0, "cls": banana_cls.value,
+                   "weight": weight, "finger": finger, "size": hand.value,
+                   "img": det.get("image_path", ""), "farm": self.farm}
+            self.classified_signal.emit(job)
+            self.error_signal.emit(f"Invalid Classes plate#{p}")
             return
 
         # ── ⑤ SAVE TO DATABASE ──────────────────────────────────
@@ -593,10 +614,19 @@ class PipelineThread(QThread):
                "weight": weight, "finger": finger, "size": hand.value,
                "img": det.get("image_path", ""), "farm": self.farm}
 
-        if bin_num not in self._active_jobs:   # store for when PLATE_IN_BIN arrives
-            self._active_jobs[bin_num] = []
-        self._active_jobs[bin_num].append(job)
+        with self._jobs_lock:
+            if bin_num not in self._active_jobs:
+                self._active_jobs[bin_num] = []
+            self._active_jobs[bin_num].append(job)
+            depth = len(self._active_jobs[bin_num])
 
+        if depth > 3:
+            print(f"  [warn] bin {bin_num} has {depth} unconfirmed plates"
+                  f" — PLATE_IN_BIN may be lost")
+
+        # Clear the event BEFORE restarting the motor so any SCALE_STOP
+        # that arrives after this point belongs to the next plate and is kept.
+        self.serial_reader.scale_event.clear()
         self.arduino.sendAssign(bin_num)   # Arduino restarts motor immediately
         print(f"  [5] ✓ assign:{bin_num} sent — motor restarted by Arduino")
 
@@ -663,6 +693,7 @@ class MainWindow(QWidget):
         # ── Kick the motor so a plate advances to the scale ─────────────
         # The scale switch will stop the motor automatically; the pipeline
         # then wakes up on the resulting SCALE_STOP event.
+        self.serial_reader.scale_event.clear()   # ensure clean state before first motor start
         try:
             arduino.writeSerial("next:")
             print("Motor started — waiting for first plate at scale…")
@@ -727,16 +758,19 @@ class MainWindow(QWidget):
                 self.ui.lblImg.setPixmap(QPixmap.fromImage(qi))
         row = self.ui.tblResult.rowCount()
         self.ui.tblResult.insertRow(row)
-        vals = [str(job["plate"]), job["cls"], f"{job['weight']:.1f}",
-                job["finger"], job["size"], job["farm"],
-                f"bin:{job['bin']}"]
+        vals = [job["cls"], f"{job['weight']:.1f}",
+                job["finger"], job["size"], str(job["bin"]) if job["bin"] else "-", job["farm"]]
         cols = min(len(vals), self.ui.tblResult.columnCount())
         for col in range(cols):
             self.ui.tblResult.setItem(row, col, QTableWidgetItem(vals[col]))
         self.ui.tblResult.scrollToBottom()
-        self.setWindowTitle(
-            f"Sorter — plate#{job['plate']} → {job['cls']}"
-            f" bin:{job['bin']}  sorting…")
+        if job["bin"]:
+            self.setWindowTitle(
+                f"Sorter — plate#{job['plate']} → {job['cls']}"
+                f" bin:{job['bin']}  sorting…")
+        else:
+            self.setWindowTitle(
+                f"Sorter — plate#{job['plate']} → {job['cls']} — skipped")
 
     def _onSorted(self, job):
         print(f"UI: ✓ Sorted plate#{job['plate']} {job['cls']}"

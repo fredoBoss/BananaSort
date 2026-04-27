@@ -161,6 +161,11 @@
                                 </column>
                                 <column>
                                     <property name="text">
+                                        <string>Bin</string>
+                                    </property>
+                                </column>
+                                <column>
+                                    <property name="text">
                                         <string>Farm</string>
                                     </property>
                                 </column>
