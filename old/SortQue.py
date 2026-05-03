@@ -70,6 +70,7 @@ class Config:
     MIN_VALID_FRAMES    = 3
     FLUSH_FRAMES        = 5
     FLUSH_DELAY_MS      = 60
+    ZOOM_FACTOR         = 1.3   # digital center-crop zoom (1.0 = no zoom)
 
     WEIGHT_THRESHOLD_G  = 5.0
     WEIGHT_STABLE_N     = 4
@@ -99,6 +100,7 @@ class Config:
 # FIREBASE
 # ─────────────────────────────────────────────────────
 firebase_connected = False
+_tare_offset = 0.0
 
 def testFirebaseConnection():
     global firebase_connected
@@ -118,7 +120,7 @@ def getWeightFromFirebase() -> float:
             r = requests.get(f"{Config.FIREBASE_URL}/Weight.json",
                             timeout=Config.FIREBASE_TIMEOUT_S)
             if r.status_code == 200 and r.json() is not None:
-                w = float(r.json())
+                w = float(r.json()) - _tare_offset
                 if Config.MIN_VALID_WEIGHT_G <= w <= Config.MAX_VALID_WEIGHT_G:
                     return w
                 print(f"  Weight out of range: {w:.1f}g")
@@ -390,11 +392,20 @@ class VideoThread(QThread):
             if self._frame is not None: return True, self._frame.copy()
         return False, None
 
+    @staticmethod
+    def _zoom(frame, factor):
+        if factor <= 1.0: return frame
+        h, w = frame.shape[:2]
+        ch, cw = int(h / factor), int(w / factor)
+        y0, x0 = (h - ch) // 2, (w - cw) // 2
+        return cv2.resize(frame[y0:y0+ch, x0:x0+cw], (w, h), interpolation=cv2.INTER_LINEAR)
+
     def run(self):
         while self.running:
             t0 = time.time()
             ret, frame = self.cam.read()
             if ret and frame is not None:
+                frame = self._zoom(frame, Config.ZOOM_FACTOR)
                 with self._lock: self._frame = frame.copy()
                 self.frame_signal.emit(frame)
             else:
@@ -627,6 +638,7 @@ class PipelineThread(QThread):
         # Clear the event BEFORE restarting the motor so any SCALE_STOP
         # that arrives after this point belongs to the next plate and is kept.
         self.serial_reader.scale_event.clear()
+        time.sleep(2.0)
         self.arduino.sendAssign(bin_num)   # Arduino restarts motor immediately
         print(f"  [5] ✓ assign:{bin_num} sent — motor restarted by Arduino")
 
@@ -671,7 +683,18 @@ class MainWindow(QWidget):
         print("App ready")
 
     def onTare(self):
-        showMsg("Tare", "Send 'forcetare' via NodeMCU serial to re-tare.")
+        global _tare_offset
+        try:
+            r = requests.get(f"{Config.FIREBASE_URL}/Weight.json",
+                             timeout=Config.FIREBASE_TIMEOUT_S)
+            if r.status_code == 200 and r.json() is not None:
+                _tare_offset = float(r.json())
+                print(f"Tare set: offset = {_tare_offset:.1f}g")
+                showMsg("Tare", f"Weight zeroed. Offset = {_tare_offset:.1f} g")
+                return
+        except Exception:
+            pass
+        showMsg("Tare", "Could not read weight from Firebase.")
 
     def onStart(self):
         global cam
