@@ -45,7 +45,7 @@ import os
 from enum import Enum
 import requests
 
-from PyQt5.QtWidgets import QApplication, QTableWidgetItem, QWidget, QMessageBox
+from PyQt5.QtWidgets import QApplication, QTableWidgetItem, QWidget, QMessageBox, QInputDialog
 from PyQt5.QtGui import QPixmap, QImage
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5 import uic
@@ -100,7 +100,7 @@ class Config:
 # FIREBASE
 # ─────────────────────────────────────────────────────
 firebase_connected = False
-_tare_offset = 0.0
+_tare_offset = 0.0   # WeightRaw captured at last tare press
 
 def testFirebaseConnection():
     global firebase_connected
@@ -117,13 +117,13 @@ def testFirebaseConnection():
 def getWeightFromFirebase() -> float:
     for attempt in range(Config.FIREBASE_RETRY):
         try:
-            r = requests.get(f"{Config.FIREBASE_URL}/Weight.json",
+            r = requests.get(f"{Config.FIREBASE_URL}/WeightRaw.json",
                             timeout=Config.FIREBASE_TIMEOUT_S)
             if r.status_code == 200 and r.json() is not None:
                 w = float(r.json()) - _tare_offset
                 if Config.MIN_VALID_WEIGHT_G <= w <= Config.MAX_VALID_WEIGHT_G:
                     return w
-                print(f"  Weight out of range: {w:.1f}g")
+                print(f"  Weight out of range: {w:.1f}g (raw={float(r.json()):.1f}, tare={_tare_offset:.1f})")
                 return -1
         except requests.exceptions.Timeout:
             print(f"  Firebase timeout ({attempt+1}/{Config.FIREBASE_RETRY})")
@@ -195,7 +195,6 @@ def saveToDatabase(farm, cls, weight, finger, size, conf, x1, y1, x2, y2):
 # ─────────────────────────────────────────────────────
 model:   YOLO | None                 = None
 arduino: arduinoCommunication | None = None
-cam:     cv2.VideoCapture | None     = None
 
 def loadModel():
     global model
@@ -206,20 +205,6 @@ def startArduino():
     global arduino
     arduino = arduinoCommunication(Config.ARDUINO_PORT, Config.ARDUINO_BAUD)
     print("Arduino: OK")
-
-def initCamera() -> bool:
-    global cam
-    if cam and cam.isOpened(): cam.release()
-    cam = cv2.VideoCapture(0)
-    cam.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 640)
-    cam.set(cv2.CAP_PROP_BUFFERSIZE,   2)
-    if not cam.isOpened(): return False
-    for _ in range(8):
-        ret, _ = cam.read()
-        if not ret: cam.release(); return False
-    print("✓ Camera ready")
-    return True
 
 
 # ─────────────────────────────────────────────────────
@@ -376,16 +361,52 @@ def captureImage(get_frame_fn) -> dict:
 
 
 # ─────────────────────────────────────────────────────
+# STARTUP THREAD — loads model/firebase/arduino off the main thread
+# ─────────────────────────────────────────────────────
+class StartupThread(QThread):
+    status_signal = pyqtSignal(str)
+    ready_signal  = pyqtSignal(object)  # dict: model/firebase/arduino → bool
+
+    def run(self):
+        results = {'model': False, 'firebase': False, 'arduino': False}
+
+        self.status_signal.emit("Loading model…")
+        try:
+            loadModel()
+            results['model'] = True
+        except Exception as e:
+            print(f"Model load failed: {e}")
+
+        self.status_signal.emit("Connecting to Firebase…")
+        try:
+            testFirebaseConnection()
+            results['firebase'] = firebase_connected
+        except Exception as e:
+            print(f"Firebase check failed: {e}")
+
+        self.status_signal.emit("Starting Arduino…")
+        try:
+            startArduino()
+            results['arduino'] = arduino is not None
+        except Exception as e:
+            print(f"Arduino init failed: {e}")
+
+        self.ready_signal.emit(results)
+
+
+# ─────────────────────────────────────────────────────
 # VIDEO THREAD
 # ─────────────────────────────────────────────────────
 class VideoThread(QThread):
     frame_signal = pyqtSignal(np.ndarray)
     error_signal = pyqtSignal(str)
+    ready_signal = pyqtSignal()   # emitted after camera warm-up succeeds
 
-    def __init__(self, cam):
+    def __init__(self):
         super().__init__()
-        self.cam = cam; self.running = True
-        self._frame = None; self._lock = threading.Lock()
+        self.running = True
+        self._frame  = None
+        self._lock   = threading.Lock()
 
     def get_latest_frame(self):
         with self._lock:
@@ -401,9 +422,29 @@ class VideoThread(QThread):
         return cv2.resize(frame[y0:y0+ch, x0:x0+cw], (w, h), interpolation=cv2.INTER_LINEAR)
 
     def run(self):
+        cam = cv2.VideoCapture(0)
+        cam.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 640)
+        cam.set(cv2.CAP_PROP_BUFFERSIZE,   2)
+        if not cam.isOpened():
+            self.error_signal.emit("Cannot open camera.")
+            return
+        for _ in range(8):
+            ret, frame = cam.read()
+            if not ret:
+                cam.release()
+                self.error_signal.emit("Camera warm-up failed.")
+                return
+            if frame is not None:
+                frame = self._zoom(frame, Config.ZOOM_FACTOR)
+                with self._lock: self._frame = frame.copy()
+                self.frame_signal.emit(frame)
+        print("✓ Camera ready")
+        self.ready_signal.emit()
+
         while self.running:
             t0 = time.time()
-            ret, frame = self.cam.read()
+            ret, frame = cam.read()
             if ret and frame is not None:
                 frame = self._zoom(frame, Config.ZOOM_FACTOR)
                 with self._lock: self._frame = frame.copy()
@@ -412,6 +453,7 @@ class VideoThread(QThread):
                 self.error_signal.emit("Camera read failed")
                 self.running = False; break
             self.msleep(max(0,int((1/30-(time.time()-t0))*1000)))
+        cam.release()
         print("VideoThread stopped")
 
     def stop(self): self.running = False; self.wait()
@@ -663,7 +705,7 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.ui = uic.loadUi("old/ui/resultUi.ui", self)
-        self.setWindowTitle("Banana Sorter — Pipeline")
+        self.setWindowTitle("Banana Sorter — Starting…")
         self.showMaximized()
 
         self.video_thread    = None
@@ -673,94 +715,131 @@ class MainWindow(QWidget):
         self.ui.btnStart.clicked.connect(self.onStart)
         self.ui.btnStop.clicked.connect(self.onStop)
         self.ui.btnTare.clicked.connect(self.onTare)
+        self.ui.btnAddFarm.clicked.connect(self.onAddFarm)
+        self.ui.btnNext.clicked.connect(self.onNext)
 
-        testFirebaseConnection()
-        loadModel()
-        startArduino()
-        time.sleep(2)
-        if not firebase_connected:
-            showMsg("Warning", "Firebase not connected.")
+        self.ui.btnStart.setEnabled(False)
+        self._startup = StartupThread()
+        self._startup.status_signal.connect(
+            lambda msg: self.setWindowTitle(f"Banana Sorter — {msg}"))
+        self._startup.ready_signal.connect(self._onStartupReady)
+        self._startup.start()
+
+    def _onStartupReady(self, results: dict):
+        errors = []
+        if not results['model']:
+            errors.append("YOLO model failed to load (check weights/segment1.pt)")
+        if not results['arduino']:
+            errors.append(f"Arduino not found on {Config.ARDUINO_PORT}")
+        if errors:
+            showMsg("Startup Failed",
+                    "System cannot start — fix these issues and restart:\n\n• "
+                    + "\n• ".join(errors))
+            self.setWindowTitle("Banana Sorter — Startup failed")
+            return   # btnStart stays disabled
+
+        if not results['firebase']:
+            showMsg("Warning", "Firebase not connected — weight sensing unavailable.")
+        self.ui.btnStart.setEnabled(True)
+        self.setWindowTitle("Banana Sorter — Ready")
         print("App ready")
+
+    def onNext(self):
+        if arduino:
+            try:
+                arduino.writeSerial("next:")
+                print("Manual next: motor started")
+            except Exception as e:
+                showMsg("Error", f"Failed to send next: {e}")
+
+    def onAddFarm(self):
+        name, ok = QInputDialog.getText(self, "Add Farm", "Farm name:")
+        if ok and name.strip():
+            name = name.strip()
+            cb = self.ui.cBoxFarm
+            if cb.findText(name) == -1:
+                cb.addItem(name)
+            cb.setCurrentText(name)
 
     def onTare(self):
         global _tare_offset
         try:
-            r = requests.get(f"{Config.FIREBASE_URL}/Weight.json",
+            r = requests.get(f"{Config.FIREBASE_URL}/WeightRaw.json",
                              timeout=Config.FIREBASE_TIMEOUT_S)
             if r.status_code == 200 and r.json() is not None:
                 _tare_offset = float(r.json())
-                print(f"Tare set: offset = {_tare_offset:.1f}g")
-                showMsg("Tare", f"Weight zeroed. Offset = {_tare_offset:.1f} g")
+                # write display value and purge stale keys left by earlier iterations
+                for path in ("BASE_TARE_WEIGHT", "BaseTareWeight", "TareCmd"):
+                    try:
+                        requests.delete(f"{Config.FIREBASE_URL}/{path}.json",
+                                        timeout=Config.FIREBASE_TIMEOUT_S)
+                    except Exception:
+                        pass
+                requests.put(f"{Config.FIREBASE_URL}/BASE_TARE_WEIGHT.json",
+                             json=_tare_offset, timeout=Config.FIREBASE_TIMEOUT_S)
+                print(f"Tare set: WeightRaw = {_tare_offset:.2f}g → offset saved")
+                showMsg("Tare", f"Tare set. Offset = {_tare_offset:.2f} g")
                 return
         except Exception:
             pass
-        showMsg("Tare", "Could not read weight from Firebase.")
+        showMsg("Tare", "Could not read WeightRaw from Firebase.")
 
     def onStart(self):
-        global cam
         if not firebase_connected:
             if QMessageBox.question(self, "Firebase?",
                 "Firebase not connected. Continue?",
                 QMessageBox.Yes | QMessageBox.No) == QMessageBox.No:
                 return
-        if not initCamera():
-            showMsg("Camera Error", "Cannot open camera.")
-            return
 
         farm = self.ui.cBoxFarm.currentText()
 
-        # ── Serial reader (must start first — pipeline waits on its event) ──
         self.serial_reader = SerialReaderThread(arduino.serialComm)
         self.serial_reader.start()
 
-        # ── Kick the motor so a plate advances to the scale ─────────────
-        # The scale switch will stop the motor automatically; the pipeline
-        # then wakes up on the resulting SCALE_STOP event.
-        self.serial_reader.scale_event.clear()   # ensure clean state before first motor start
+        self.serial_reader.scale_event.clear()
         try:
             arduino.writeSerial("next:")
             print("Motor started — waiting for first plate at scale…")
         except Exception as e:
             print(f"  [motor start failed] {e}")
 
-        self.video_thread = VideoThread(cam)
+        self.video_thread = VideoThread()
         self.video_thread.frame_signal.connect(self._showFrame)
         self.video_thread.error_signal.connect(lambda m: showMsg("Video", m))
+        self.video_thread.ready_signal.connect(lambda: self._startPipeline(farm))
+        self.video_thread.start()
 
+        self.ui.btnStart.setEnabled(False)
+        self.ui.cBoxFarm.setEnabled(False)
+        self.ui.btnAddFarm.setEnabled(False)
+        self.ui.btnStop.setEnabled(True)
+        self.ui.btnNext.setEnabled(True)
+        self.setWindowTitle("Banana Sorter — Starting camera…")
+
+    def _startPipeline(self, farm: str):
         self.pipeline_thread = PipelineThread(
             arduino, self.video_thread, farm, self.serial_reader)
         self.pipeline_thread.classified_signal.connect(self._onClassified)
         self.pipeline_thread.sorted_signal.connect(self._onSorted)
         self.pipeline_thread.error_signal.connect(self._onError)
-
-        # Wire PLATE_IN_BIN events to pipeline so sorted_signal fires
         self.serial_reader.plate_sorted_signal.connect(
             self.pipeline_thread.on_plate_sorted)
-
-        self.video_thread.start()
         self.pipeline_thread.start()
-
-        self.ui.btnStart.setEnabled(False)
-        self.ui.cBoxFarm.setEnabled(False)
-        self.ui.btnStop.setEnabled(True)
         self.setWindowTitle("Banana Sorter — Running")
         print("Pipeline started")
 
     def onStop(self):
-        global cam
-        # Stop threads first so no more serial writes race with motorStop:
         for t in (self.pipeline_thread, self.video_thread, self.serial_reader):
             if t: t.stop()
         self.pipeline_thread = self.video_thread = self.serial_reader = None
-        # Stop the motor and clear Arduino job state
         if arduino:
             try:
                 arduino.writeSerial("motorStop:")
             except Exception as e:
                 print(f"  [motorStop send failed] {e}")
-        if cam and cam.isOpened(): cam.release(); cam = None
         self.ui.btnStart.setEnabled(True)
         self.ui.cBoxFarm.setEnabled(True)
+        self.ui.btnAddFarm.setEnabled(True)
         self.ui.btnStop.setEnabled(False)
         self.setWindowTitle("Banana Sorter — Stopped")
         print("Pipeline stopped")
