@@ -133,10 +133,12 @@ def getWeightFromFirebase() -> float:
             time.sleep(0.3)
     return -1
 
-def waitForStableWeight() -> tuple:
+def waitForStableWeight(stop_flag=None) -> tuple:
     readings, zero_streak = [], 0
     start = time.time()
     while (time.time() - start) < Config.WEIGHT_TIMEOUT_S:
+        if stop_flag and stop_flag.is_set():
+            return -1, False
         w = getWeightFromFirebase()
         if w < 0:
             time.sleep(0.3); continue
@@ -178,6 +180,7 @@ def saveToDatabase(farm, cls, weight, finger, size, conf, x1, y1, x2, y2):
         print("  ✗ DB: not connected, skipping save")
         return
     try:
+        db.ping(reconnect=True, attempts=3, delay=1)
         cur = db.cursor()
         cur.execute(
             """INSERT INTO finger_classes
@@ -199,7 +202,10 @@ arduino: arduinoCommunication | None = None
 def loadModel():
     global model
     model = YOLO("weights/segment1.pt")
-    print("YOLO model loaded")
+    dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+    model.predict(source=dummy, conf=Config.CONF_THRESHOLD,
+                  iou=Config.IOU_THRESHOLD, save=False, verbose=False)
+    print("YOLO model loaded and warmed up")
 
 def startArduino():
     global arduino
@@ -288,7 +294,7 @@ def captureImage(get_frame_fn) -> dict:
         get_frame_fn(); time.sleep(Config.FLUSH_DELAY_MS/1000)
 
     vote_counts = {}
-    best_conf, best_box, best_frame = 0.0, None, None
+    best_by_label = {}   # label → (conf, box, frame, result)
 
     for i in range(Config.CAPTURE_FRAMES):
         ret, frame = get_frame_fn()
@@ -308,11 +314,12 @@ def captureImage(get_frame_fn) -> dict:
         confs = result.boxes.conf
         if len(confs) > 0:
             idx = int(confs.argmax()); conf_val = float(confs[idx])
-            if conf_val > best_conf:
-                best_conf  = conf_val
-                best_box   = list(map(int, result.boxes.xyxy[idx]))
-                best_frame = frame.copy()
-        print(f"  Frame {i+1}: {label}  conf={best_conf:.2f}")
+            prev = best_by_label.get(label)
+            if prev is None or conf_val > prev[0]:
+                best_by_label[label] = (conf_val,
+                                        list(map(int, result.boxes.xyxy[idx])),
+                                        frame.copy(), result)
+        print(f"  Frame {i+1}: {label}  conf={float(confs.max()):.2f}")
         time.sleep(Config.CAPTURE_INTERVAL_MS/1000)
 
     if not vote_counts:
@@ -324,6 +331,9 @@ def captureImage(get_frame_fn) -> dict:
     if win_votes < Config.MIN_VALID_FRAMES:
         print(f"  ✗ Weak consensus"); return res
 
+    best_conf, best_box, best_frame, best_result = best_by_label.get(
+        winner, (0.0, None, None, None))
+
     res["finger"] = [best_conf, winner]
     if best_box:
         res["x1"],res["y1"] = best_box[0],best_box[1]
@@ -331,8 +341,7 @@ def captureImage(get_frame_fn) -> dict:
 
     if best_frame is not None and best_box:
         overlay = best_frame.copy()
-        ann = model.predict(source=best_frame, conf=Config.CONF_THRESHOLD,
-                            iou=Config.IOU_THRESHOLD, save=False, verbose=False)[0]
+        ann = best_result   # reuse cached result — no second inference
         if ann.masks is not None:
             for idx,(mpts,box,c) in enumerate(
                     zip(ann.masks.xy,ann.boxes.xyxy,ann.boxes.conf)):
@@ -370,10 +379,11 @@ class StartupThread(QThread):
     def run(self):
         results = {'model': False, 'firebase': False, 'arduino': False}
 
-        self.status_signal.emit("Loading model…")
+        self.status_signal.emit("Loading YOLO model…")
         try:
             loadModel()
             results['model'] = True
+            self.status_signal.emit("YOLO model ready")
         except Exception as e:
             print(f"Model load failed: {e}")
 
@@ -554,6 +564,7 @@ class PipelineThread(QThread):
         self.farm          = farm
         self.serial_reader = serial_reader
         self.running       = True
+        self._stop_flag    = threading.Event()
         self._paused       = False
         self._plate_num    = 0
         # FIFO list per bin — multiple plates can share the same bin.
@@ -605,6 +616,8 @@ class PipelineThread(QThread):
         print(f"  [1] Waiting for plate at scale…")
         arrived = self.serial_reader.scale_event.wait(
             timeout=Config.SCALE_TIMEOUT_S)
+        if not self.running:
+            return
         if not arrived:
             self.error_signal.emit(f"Scale timeout plate#{p}")
             # Clear before restarting so the next plate's SCALE_STOP isn't missed
@@ -614,9 +627,13 @@ class PipelineThread(QThread):
 
         # ── ② WEIGH (Firebase) ───────────────────────────────────
         # Plate is stationary — weight converges quickly.
-        time.sleep(Config.WEIGHT_SETTLE_S)
+        self._stop_flag.wait(Config.WEIGHT_SETTLE_S)
+        if not self.running:
+            return
         print(f"  [2] Weighing…")
-        weight, ok = waitForStableWeight()
+        weight, ok = waitForStableWeight(self._stop_flag)
+        if not self.running:
+            return
         if not ok or weight <= 0:
             # Weight failed — skip plate, restart motor
             print(f"  [2] ✗ Weight fail — skipping plate#{p}")
@@ -680,7 +697,9 @@ class PipelineThread(QThread):
         # Clear the event BEFORE restarting the motor so any SCALE_STOP
         # that arrives after this point belongs to the next plate and is kept.
         self.serial_reader.scale_event.clear()
-        time.sleep(2.0)
+        self._stop_flag.wait(2.0)
+        if not self.running:
+            return
         self.arduino.sendAssign(bin_num)   # Arduino restarts motor immediately
         print(f"  [5] ✓ assign:{bin_num} sent — motor restarted by Arduino")
 
@@ -690,7 +709,12 @@ class PipelineThread(QThread):
         time.sleep(Config.CLASSIFY_COOLDOWN_S)
         # ── ⑧ Loop back to ① — sort happens automatically ────────
 
-    def stop(self): self.running = False; self.wait()
+    def stop(self):
+        self.running = False
+        self._stop_flag.set()
+        if self.serial_reader:
+            self.serial_reader.scale_event.set()  # unblock scale_event.wait()
+        self.wait(6000)
 
 
 # ─────────────────────────────────────────────────────
@@ -708,24 +732,36 @@ class MainWindow(QWidget):
         self.setWindowTitle("Banana Sorter — Starting…")
         self.showMaximized()
 
-        self.video_thread    = None
         self.pipeline_thread = None
         self.serial_reader   = None
+        self._startup_ok     = False
+        self._camera_ok      = False
+        self._startup_results = {}
 
         self.ui.btnStart.clicked.connect(self.onStart)
         self.ui.btnStop.clicked.connect(self.onStop)
-        # self.ui.btnTare.clicked.connect(self.onTare)
-        self.ui.btnTare.hide()
         self.ui.btnNext.clicked.connect(self.onNext)
 
         self.ui.btnStart.setEnabled(False)
+
+        self.video_thread = VideoThread()
+        self.video_thread.frame_signal.connect(self._showFrame)
+        self.video_thread.error_signal.connect(lambda m: showMsg("Video", m))
+        self.video_thread.ready_signal.connect(self._onCameraReady)
+        self.video_thread.start()
+
         self._startup = StartupThread()
         self._startup.status_signal.connect(
             lambda msg: self.setWindowTitle(f"Banana Sorter — {msg}"))
         self._startup.ready_signal.connect(self._onStartupReady)
         self._startup.start()
 
+    def _onCameraReady(self):
+        self._camera_ok = True
+        self._checkReady()
+
     def _onStartupReady(self, results: dict):
+        self._startup_results = results
         errors = []
         if not results['model']:
             errors.append("YOLO model failed to load (check weights/segment1.pt)")
@@ -737,12 +773,16 @@ class MainWindow(QWidget):
                     + "\n• ".join(errors))
             self.setWindowTitle("Banana Sorter — Startup failed")
             return   # btnStart stays disabled
-
         if not results['firebase']:
             showMsg("Warning", "Firebase not connected — weight sensing unavailable.")
-        self.ui.btnStart.setEnabled(True)
-        self.setWindowTitle("Banana Sorter — Ready")
-        print("App ready")
+        self._startup_ok = True
+        self._checkReady()
+
+    def _checkReady(self):
+        if self._startup_ok and self._camera_ok:
+            self.ui.btnStart.setEnabled(True)
+            self.setWindowTitle("Banana Sorter — Ready")
+            print("App ready")
 
     def onNext(self):
         if arduino:
@@ -794,17 +834,13 @@ class MainWindow(QWidget):
         except Exception as e:
             print(f"  [motor start failed] {e}")
 
-        self.video_thread = VideoThread()
-        self.video_thread.frame_signal.connect(self._showFrame)
-        self.video_thread.error_signal.connect(lambda m: showMsg("Video", m))
-        self.video_thread.ready_signal.connect(lambda: self._startPipeline(farm))
-        self.video_thread.start()
+        self._startPipeline(farm)
 
         self.ui.btnStart.setEnabled(False)
         self.ui.cBoxFarm.setEnabled(False)
         self.ui.btnStop.setEnabled(True)
         self.ui.btnNext.setEnabled(True)
-        self.setWindowTitle("Banana Sorter — Starting camera…")
+        self.setWindowTitle("Banana Sorter — Running")
 
     def _startPipeline(self, farm: str):
         self.pipeline_thread = PipelineThread(
@@ -819,9 +855,9 @@ class MainWindow(QWidget):
         print("Pipeline started")
 
     def onStop(self):
-        for t in (self.pipeline_thread, self.video_thread, self.serial_reader):
+        for t in (self.pipeline_thread, self.serial_reader):
             if t: t.stop()
-        self.pipeline_thread = self.video_thread = self.serial_reader = None
+        self.pipeline_thread = self.serial_reader = None
         if arduino:
             try:
                 arduino.writeSerial("motorStop:")
@@ -832,6 +868,13 @@ class MainWindow(QWidget):
         self.ui.btnStop.setEnabled(False)
         self.setWindowTitle("Banana Sorter — Stopped")
         print("Pipeline stopped")
+
+    def closeEvent(self, event):
+        self.onStop()
+        if self.video_thread:
+            self.video_thread.stop()
+            self.video_thread = None
+        event.accept()
 
     def _showFrame(self, frame):
         try:
