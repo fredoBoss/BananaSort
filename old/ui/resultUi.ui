@@ -86,13 +86,13 @@
                         </item>
                         <item row="2" column="1">
                             <layout class="QHBoxLayout" name="horizontalLayout_2">
-                                <item>
+                                <!-- <item>
                                     <widget class="QPushButton" name="btnTare">
                                         <property name="text">
                                             <string>Tare</string>
                                         </property>
                                     </widget>
-                                </item>
+                                </item> -->
                                 <item>
                                     <widget class="QPushButton" name="btnStart">
                                         <property name="enabled">
@@ -107,6 +107,19 @@
                                     <widget class="QPushButton" name="btnStop">
                                         <property name="text">
                                             <string>Stop</string>
+                                        </property>
+                                    </widget>
+                                </item>
+                                <item>
+                                    <widget class="QPushButton" name="btnNext">
+                                        <property name="enabled">
+                                            <bool>true</bool>
+                                        </property>
+                                        <property name="text">
+                                            <string>Next</string>
+                                        </property>
+                                        <property name="toolTip">
+                                            <string>Force-start motor (next:)</string>
                                         </property>
                                     </widget>
                                 </item>

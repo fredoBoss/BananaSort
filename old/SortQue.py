@@ -117,7 +117,7 @@ def testFirebaseConnection():
 def getWeightFromFirebase() -> float:
     for attempt in range(Config.FIREBASE_RETRY):
         try:
-            r = requests.get(f"{Config.FIREBASE_URL}/WeightRaw.json",
+            r = requests.get(f"{Config.FIREBASE_URL}/Weight.json",
                             timeout=Config.FIREBASE_TIMEOUT_S)
             if r.status_code == 200 and r.json() is not None:
                 w = float(r.json()) - _tare_offset
@@ -714,8 +714,8 @@ class MainWindow(QWidget):
 
         self.ui.btnStart.clicked.connect(self.onStart)
         self.ui.btnStop.clicked.connect(self.onStop)
-        self.ui.btnTare.clicked.connect(self.onTare)
-        self.ui.btnAddFarm.clicked.connect(self.onAddFarm)
+        # self.ui.btnTare.clicked.connect(self.onTare)
+        self.ui.btnTare.hide()
         self.ui.btnNext.clicked.connect(self.onNext)
 
         self.ui.btnStart.setEnabled(False)
@@ -751,15 +751,6 @@ class MainWindow(QWidget):
                 print("Manual next: motor started")
             except Exception as e:
                 showMsg("Error", f"Failed to send next: {e}")
-
-    def onAddFarm(self):
-        name, ok = QInputDialog.getText(self, "Add Farm", "Farm name:")
-        if ok and name.strip():
-            name = name.strip()
-            cb = self.ui.cBoxFarm
-            if cb.findText(name) == -1:
-                cb.addItem(name)
-            cb.setCurrentText(name)
 
     def onTare(self):
         global _tare_offset
@@ -811,7 +802,6 @@ class MainWindow(QWidget):
 
         self.ui.btnStart.setEnabled(False)
         self.ui.cBoxFarm.setEnabled(False)
-        self.ui.btnAddFarm.setEnabled(False)
         self.ui.btnStop.setEnabled(True)
         self.ui.btnNext.setEnabled(True)
         self.setWindowTitle("Banana Sorter — Starting camera…")
@@ -839,7 +829,6 @@ class MainWindow(QWidget):
                 print(f"  [motorStop send failed] {e}")
         self.ui.btnStart.setEnabled(True)
         self.ui.cBoxFarm.setEnabled(True)
-        self.ui.btnAddFarm.setEnabled(True)
         self.ui.btnStop.setEnabled(False)
         self.setWindowTitle("Banana Sorter — Stopped")
         print("Pipeline stopped")

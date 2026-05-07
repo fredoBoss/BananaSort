@@ -2,7 +2,7 @@
 // Enhanced ESP8266 code for banana sorter weight node
 // Changes vs original:
 //   • Dynamic BASE_TARE_WEIGHT stored in EEPROM (set via serial command "settare")
-//   • Uploads both raw and adjusted weight to Firebase for debugging
+//   • Uploads only adjusted weight (Weight) to Firebase — WeightRaw removed
 //   • Median-of-7 instead of median-of-5 for better noise rejection
 //   • Publishes status flag ("ready" / "taring") so Python knows when to trust weight
 //   • "forcetare" command re-tares and saves new base
@@ -261,9 +261,6 @@ void syncDataToFirebase() {
   } else {
     Serial.println("Firebase error: " + fbdo.errorReason());
   }
-
-  // Upload raw for debug
-  Firebase.RTDB.setFloat(&fbdo, "WeightRaw", raw);
 
   // Upload status
   Firebase.RTDB.setString(&fbdo, "Status", "ready");
