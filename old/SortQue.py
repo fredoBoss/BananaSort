@@ -405,6 +405,33 @@ class StartupThread(QThread):
 
 
 # ─────────────────────────────────────────────────────
+# WEIGHT POLLER THREAD
+# ─────────────────────────────────────────────────────
+class WeightPollerThread(QThread):
+    weight_signal = pyqtSignal(float)   # -1.0 = no reading
+
+    def __init__(self):
+        super().__init__()
+        self.running = True
+
+    def run(self):
+        while self.running:
+            w = -1.0
+            try:
+                r = requests.get(f"{Config.FIREBASE_URL}/Weight.json", timeout=2)
+                if r.status_code == 200 and r.json() is not None:
+                    w = float(r.json()) - _tare_offset
+            except Exception:
+                pass
+            self.weight_signal.emit(w)
+            self.msleep(300)
+
+    def stop(self):
+        self.running = False
+        self.wait(2000)
+
+
+# ─────────────────────────────────────────────────────
 # VIDEO THREAD
 # ─────────────────────────────────────────────────────
 class VideoThread(QThread):
@@ -750,6 +777,19 @@ class MainWindow(QWidget):
         self.video_thread.ready_signal.connect(self._onCameraReady)
         self.video_thread.start()
 
+        from PyQt5.QtWidgets import QLabel
+        from PyQt5.QtCore import Qt
+        self._weight_label = QLabel("Weight: -- g")
+        self._weight_label.setAlignment(Qt.AlignCenter)
+        self._weight_label.setStyleSheet(
+            "background: rgba(0,0,0,160); color: #00FF88;"
+            "font-size: 16px; font-weight: bold; padding: 4px; border-radius: 4px;")
+        self.ui.frame.layout().addWidget(self._weight_label, 1, 0)
+
+        self._weight_poller = WeightPollerThread()
+        self._weight_poller.weight_signal.connect(self._onWeightUpdate)
+        self._weight_poller.start()
+
         self._startup = StartupThread()
         self._startup.status_signal.connect(
             lambda msg: self.setWindowTitle(f"Banana Sorter — {msg}"))
@@ -874,7 +914,16 @@ class MainWindow(QWidget):
         if self.video_thread:
             self.video_thread.stop()
             self.video_thread = None
+        if self._weight_poller:
+            self._weight_poller.stop()
+            self._weight_poller = None
         event.accept()
+
+    def _onWeightUpdate(self, w: float):
+        if w < 0:
+            self._weight_label.setText("Weight: -- g")
+        else:
+            self._weight_label.setText(f"Weight: {w:.1f} g")
 
     def _showFrame(self, frame):
         try:
