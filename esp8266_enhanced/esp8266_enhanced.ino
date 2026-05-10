@@ -3,10 +3,12 @@
 // Changes vs original:
 //   • Dynamic BASE_TARE_WEIGHT stored in EEPROM (set via serial command "settare")
 //   • Uploads only adjusted weight (Weight) to Firebase — WeightRaw removed
-//   • Median-of-7 instead of median-of-5 for better noise rejection
+//   • Median-of-7 with is_ready() pacing — each sample is a genuine independent ADC conversion
+//   • No power-down/up inside read loop — ADC stays settled between calls
+//   • EMA smoothing (α=0.25) applied on top of median for stable output
+//   • Deadband filter (1.5 g) — Firebase only written when value actually changes
 //   • Publishes status flag ("ready" / "taring") so Python knows when to trust weight
 //   • "forcetare" command re-tares and saves new base
-//   • Reduced SYNC_INTERVAL to 300ms for more responsive reads
 
 #include <ESP8266WiFi.h>
 #include <Firebase_ESP_Client.h>
@@ -53,9 +55,15 @@ FirebaseAuth  auth;
 FirebaseConfig config;
 
 unsigned long lastSyncTime = 0;
-const unsigned long SYNC_INTERVAL = 300;   // ms — faster than original 500ms
+const unsigned long SYNC_INTERVAL = 100;   // ms — measurement time (~700ms) governs actual rate
 
-bool isTaring = false;   // status flag uploaded to Firebase
+bool isTaring    = false;
+bool statusReady = false;   // tracks last uploaded Status to avoid redundant writes
+
+float emaWeight    = -1.0f;   // -1 = uninitialised
+float lastUploaded = -9999.f;
+const float EMA_ALPHA  = 0.25f;   // 25% new / 75% history — tune lower for more smoothing
+const float DEADBAND_G = 1.5f;    // skip Weight upload if change < this (grams)
 
 // ─────────────────────────────────────────────────────
 // SETUP & LOOP
@@ -97,7 +105,6 @@ void loop() {
 
   if (Serial.available()) handleSerialCommand();
 
-  delay(50);
   yield();
 }
 
@@ -217,28 +224,23 @@ float convertToWeight(long raw) {
   return (raw - ZERO_OFFSET) * SCALE_FACTOR;
 }
 
-// Median-of-7 (was median-of-5) — better outlier rejection
+// Median-of-7: waits for is_ready() per sample so each reading is a genuine HX711 conversion.
+// No power-down between calls — keeps ADC settled. At 10 SPS each wait is ~100ms → ~700ms total.
 float weightValAvg() {
-  delay(200);
   const int N = 7;
   long readings[N];
-  for (int i=0;i<N;i++) {
-    if (!scale.is_ready()) delay(50);
+  for (int i = 0; i < N; i++) {
+    unsigned long t = millis();
+    while (!scale.is_ready() && millis() - t < 200) { delay(5); yield(); }
     readings[i] = scale.get_value();
-    delay(5);
     yield();
   }
-  // bubble sort
-  for (int i=0;i<N-1;i++)
-    for (int j=0;j<N-i-1;j++)
-      if (readings[j]>readings[j+1]) {
-        long t=readings[j]; readings[j]=readings[j+1]; readings[j+1]=t;
+  for (int i = 0; i < N-1; i++)
+    for (int j = 0; j < N-i-1; j++)
+      if (readings[j] > readings[j+1]) {
+        long tmp = readings[j]; readings[j] = readings[j+1]; readings[j+1] = tmp;
       }
-  long raw = readings[N/2];   // median
-  scale.power_down();
-  delay(40);
-  scale.power_up();
-  return convertToWeight(raw);
+  return convertToWeight(readings[N/2]);
 }
 
 // ─────────────────────────────────────────────────────
@@ -246,8 +248,10 @@ float weightValAvg() {
 // ─────────────────────────────────────────────────────
 void syncDataToFirebase() {
   if (WiFi.status() != WL_CONNECTED) return;
+
   if (isTaring) {
     Firebase.RTDB.setString(&fbdo, "Status", "taring");
+    statusReady = false;
     return;
   }
 
@@ -255,15 +259,25 @@ void syncDataToFirebase() {
   float adjusted = raw - BASE_TARE_WEIGHT;
   if (adjusted < 0) adjusted = 0;
 
-  // Upload adjusted weight (what Python reads)
-  if (Firebase.RTDB.setFloat(&fbdo, "Weight", adjusted)) {
-    Serial.println("Synced  raw=" + String(raw,1) + "g  adj=" + String(adjusted,1) + "g");
-  } else {
-    Serial.println("Firebase error: " + fbdo.errorReason());
+  // EMA smoothing over median readings
+  if (emaWeight < 0) emaWeight = adjusted;
+  else               emaWeight = EMA_ALPHA * adjusted + (1.0f - EMA_ALPHA) * emaWeight;
+
+  // Only write Weight when value changes beyond deadband
+  if (abs(emaWeight - lastUploaded) >= DEADBAND_G) {
+    lastUploaded = emaWeight;
+    if (Firebase.RTDB.setFloat(&fbdo, "Weight", emaWeight)) {
+      Serial.println("Synced  raw=" + String(raw,1) + "g  ema=" + String(emaWeight,1) + "g");
+    } else {
+      Serial.println("Firebase error: " + fbdo.errorReason());
+    }
   }
 
-  // Upload status
-  Firebase.RTDB.setString(&fbdo, "Status", "ready");
+  // Only write Status when transitioning from taring to ready
+  if (!statusReady) {
+    Firebase.RTDB.setString(&fbdo, "Status", "ready");
+    statusReady = true;
+  }
 
   yield();
 }
@@ -286,6 +300,8 @@ void forceTare() {
   delay(500);
   float raw = weightValAvg();
   saveBaseTare(raw);
+  emaWeight    = -1.0f;   // reset EMA so new base takes effect immediately
+  lastUploaded = -9999.f;
   Serial.println("New BASE_TARE_WEIGHT = " + String(raw, 2) + "g");
   isTaring = false;
 }
