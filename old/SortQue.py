@@ -75,9 +75,9 @@ class Config:
     WEIGHT_THRESHOLD_G  = 5.0
     WEIGHT_STABLE_N     = 4
     WEIGHT_TIMEOUT_S    = 20
-    MIN_VALID_WEIGHT_G  = 80.0
+    MIN_VALID_WEIGHT_G  = 320.0  # lowest bin is 350g; blocks EMA ramp-up false-stable reads
     MAX_VALID_WEIGHT_G  = 1500.0
-    WEIGHT_SETTLE_S     = 1.0   # plate is already stopped at scale — settles faster
+    WEIGHT_SETTLE_S     = 3.5   # EMA α=0.25 needs ~3s to converge after banana lands
 
     W_25BCP_MIN  = 621;  W_25BCP_MAX  = 730
     W_30BCP_MIN  = 521;  W_30BCP_MAX  = 620
@@ -100,7 +100,6 @@ class Config:
 # FIREBASE
 # ─────────────────────────────────────────────────────
 firebase_connected = False
-_tare_offset = 0.0   # WeightRaw captured at last tare press
 
 def testFirebaseConnection():
     global firebase_connected
@@ -114,16 +113,16 @@ def testFirebaseConnection():
     print(f"{'✓' if firebase_connected else '✗'} Firebase")
     return firebase_connected
 
+
 def getWeightFromFirebase() -> float:
     for attempt in range(Config.FIREBASE_RETRY):
         try:
             r = requests.get(f"{Config.FIREBASE_URL}/Weight.json",
                             timeout=Config.FIREBASE_TIMEOUT_S)
             if r.status_code == 200 and r.json() is not None:
-                w = float(r.json()) - _tare_offset
+                w = float(r.json())
                 if Config.MIN_VALID_WEIGHT_G <= w <= Config.MAX_VALID_WEIGHT_G:
                     return w
-                print(f"  Weight out of range: {w:.1f}g (raw={float(r.json()):.1f}, tare={_tare_offset:.1f})")
                 return -1
         except requests.exceptions.Timeout:
             print(f"  Firebase timeout ({attempt+1}/{Config.FIREBASE_RETRY})")
@@ -391,6 +390,7 @@ class StartupThread(QThread):
         try:
             testFirebaseConnection()
             results['firebase'] = firebase_connected
+
         except Exception as e:
             print(f"Firebase check failed: {e}")
 
@@ -420,7 +420,7 @@ class WeightPollerThread(QThread):
             try:
                 r = requests.get(f"{Config.FIREBASE_URL}/Weight.json", timeout=2)
                 if r.status_code == 200 and r.json() is not None:
-                    w = float(r.json()) - _tare_offset
+                    w = float(r.json())
             except Exception:
                 pass
             self.weight_signal.emit(w)
@@ -497,6 +497,39 @@ class VideoThread(QThread):
 
 
 # ─────────────────────────────────────────────────────
+# LIMIT SWITCH ONE-SHOT READER
+# Used when pipeline is NOT running (no SerialReaderThread).
+# Sends checkLimitSw:, reads up to 8 "Limit Switch" lines, emits result.
+# ─────────────────────────────────────────────────────
+class LimitSwCheckThread(QThread):
+    result_signal = pyqtSignal(list)
+
+    def __init__(self, serial_comm):
+        super().__init__()
+        self.serial_comm = serial_comm
+
+    def run(self):
+        lines = []
+        start = time.time()
+        while len(lines) < 8 and (time.time() - start) < 5.0:
+            try:
+                if self.serial_comm.in_waiting > 0:
+                    raw  = self.serial_comm.readline()
+                    line = raw.decode('utf-8', errors='replace').rstrip()
+                    if line.startswith("Limit Switch"):
+                        lines.append(line)
+                else:
+                    time.sleep(0.02)
+            except Exception as e:
+                print(f"  [LimitSwCheckThread] {e}")
+                break
+        if lines:
+            self.result_signal.emit(lines)
+        else:
+            print("  [LimitSwCheckThread] no response from Arduino")
+
+
+# ─────────────────────────────────────────────────────
 # SERIAL READER THREAD
 #
 # Reads every line from Arduino and routes it:
@@ -508,13 +541,15 @@ class VideoThread(QThread):
 # (Firebase polling, YOLO) never blocks incoming Arduino messages.
 # ─────────────────────────────────────────────────────
 class SerialReaderThread(QThread):
-    plate_sorted_signal = pyqtSignal(int)   # bin number
+    plate_sorted_signal = pyqtSignal(int)    # bin number
+    limit_sw_signal     = pyqtSignal(list)   # list of 8 raw "Limit Switch …" lines
 
     def __init__(self, serial_comm):
         super().__init__()
         self.serial_comm  = serial_comm
         self.running      = True
         self.scale_event  = threading.Event()  # set when SCALE_STOP arrives
+        self._sw_lines    = []                 # accumulator for checkLimitSw: response
 
     def run(self):
         while self.running:
@@ -535,6 +570,13 @@ class SerialReaderThread(QThread):
                             print(f"  [bin {bin_n} click] {count}/{need}  [{bar}]")
                         except Exception:
                             print(f"  [serial rx] '{line}'")
+                        continue
+
+                    if line.startswith("Limit Switch"):
+                        self._sw_lines.append(line)
+                        if len(self._sw_lines) >= 8:
+                            self.limit_sw_signal.emit(self._sw_lines[:8])
+                            self._sw_lines = []
                         continue
 
                     print(f"  [serial rx] '{line}'")
@@ -768,6 +810,9 @@ class MainWindow(QWidget):
         self.ui.btnStart.clicked.connect(self.onStart)
         self.ui.btnStop.clicked.connect(self.onStop)
         self.ui.btnNext.clicked.connect(self.onNext)
+        self.ui.btnTestServo.clicked.connect(self.onTestServo)
+        self.ui.btnCheckSw.clicked.connect(self.onCheckLimitSw)
+
 
         self.ui.btnStart.setEnabled(False)
 
@@ -821,6 +866,7 @@ class MainWindow(QWidget):
     def _checkReady(self):
         if self._startup_ok and self._camera_ok:
             self.ui.btnStart.setEnabled(True)
+            self.ui.btnCheckSw.setEnabled(True)
             self.setWindowTitle("Banana Sorter — Ready")
             print("App ready")
 
@@ -832,28 +878,87 @@ class MainWindow(QWidget):
             except Exception as e:
                 showMsg("Error", f"Failed to send next: {e}")
 
-    def onTare(self):
-        global _tare_offset
+    def onTestServo(self):
+        if not arduino:
+            showMsg("Test Servo", "Arduino not connected.")
+            return
+        n, ok = QInputDialog.getInt(self, "Test Servo", "Servo number (1–6):", 1, 1, 6)
+        if not ok:
+            return
         try:
-            r = requests.get(f"{Config.FIREBASE_URL}/WeightRaw.json",
-                             timeout=Config.FIREBASE_TIMEOUT_S)
-            if r.status_code == 200 and r.json() is not None:
-                _tare_offset = float(r.json())
-                # write display value and purge stale keys left by earlier iterations
-                for path in ("BASE_TARE_WEIGHT", "BaseTareWeight", "TareCmd"):
-                    try:
-                        requests.delete(f"{Config.FIREBASE_URL}/{path}.json",
-                                        timeout=Config.FIREBASE_TIMEOUT_S)
-                    except Exception:
-                        pass
-                requests.put(f"{Config.FIREBASE_URL}/BASE_TARE_WEIGHT.json",
-                             json=_tare_offset, timeout=Config.FIREBASE_TIMEOUT_S)
-                print(f"Tare set: WeightRaw = {_tare_offset:.2f}g → offset saved")
-                showMsg("Tare", f"Tare set. Offset = {_tare_offset:.2f} g")
-                return
-        except Exception:
+            arduino.writeSerial(f"testServo:{n}")
+            print(f"Test servo: testServo:{n} sent")
+        except Exception as e:
+            showMsg("Error", f"Failed to send testServo:{n}: {e}")
+
+    def onCheckLimitSw(self):
+        if not arduino:
+            showMsg("Check Switches", "Arduino not connected.")
+            return
+        try:
+            arduino.writeSerial("checkLimitSw:")
+            print("checkLimitSw: sent")
+        except Exception as e:
+            showMsg("Error", f"Failed to send checkLimitSw: {e}")
+            return
+
+        if self.serial_reader and self.serial_reader.isRunning():
+            # Pipeline running — SerialReaderThread catches the 8 response lines
+            # and emits limit_sw_signal (connected in _startPipeline)
             pass
-        showMsg("Tare", "Could not read WeightRaw from Firebase.")
+        else:
+            # No pipeline — spin up one-shot reader that owns the port briefly
+            t = LimitSwCheckThread(arduino.serialComm)
+            t.result_signal.connect(self._onLimitSwData)
+            t.start()
+
+    def _onLimitSwData(self, lines: list):
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGridLayout, QLabel
+        from PyQt5.QtCore import Qt
+
+        SW_NAMES = [
+            ("SW1", "Scale / camera"),
+            ("SW2", "Spare"),
+            ("SW3", "Bin 1"),
+            ("SW4", "Bin 2"),
+            ("SW5", "Bin 3"),
+            ("SW6", "Bin 4"),
+            ("SW7", "Bin 5"),
+            ("SW8", "Bin 6"),
+        ]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Limit Switch States")
+        dlg.setMinimumWidth(320)
+        lay = QVBoxLayout(dlg)
+        grid = QGridLayout()
+
+        header_style = "font-weight:bold; padding:4px;"
+        grid.addWidget(QLabel("<b>Switch</b>", styleSheet=header_style), 0, 0)
+        grid.addWidget(QLabel("<b>Location</b>", styleSheet=header_style), 0, 1)
+        grid.addWidget(QLabel("<b>State</b>", styleSheet=header_style), 0, 2)
+
+        for row, (line, (sw_id, location)) in enumerate(zip(lines, SW_NAMES), start=1):
+            # line format: "Limit Switch N (label):  0" or ":  1"
+            raw_val = line.strip().split(":")[-1].strip()
+            pressed = raw_val == "0"   # INPUT_PULLUP: 0=pressed, 1=open
+            state_text  = "PRESSED" if pressed else "OPEN"
+            state_color = "#FF4444" if pressed else "#44CC44"
+
+            lbl_sw  = QLabel(sw_id)
+            lbl_loc = QLabel(location)
+            lbl_st  = QLabel(state_text)
+            lbl_st.setAlignment(Qt.AlignCenter)
+            lbl_st.setStyleSheet(
+                f"color:white; background:{state_color};"
+                "font-weight:bold; padding:2px 8px; border-radius:3px;")
+
+            grid.addWidget(lbl_sw,  row, 0)
+            grid.addWidget(lbl_loc, row, 1)
+            grid.addWidget(lbl_st,  row, 2)
+
+        lay.addLayout(grid)
+        dlg.exec_()
 
     def onStart(self):
         if not firebase_connected:
@@ -890,6 +995,7 @@ class MainWindow(QWidget):
         self.pipeline_thread.error_signal.connect(self._onError)
         self.serial_reader.plate_sorted_signal.connect(
             self.pipeline_thread.on_plate_sorted)
+        self.serial_reader.limit_sw_signal.connect(self._onLimitSwData)
         self.pipeline_thread.start()
         self.setWindowTitle("Banana Sorter — Running")
         print("Pipeline started")
