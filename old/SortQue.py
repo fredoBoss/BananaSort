@@ -46,7 +46,7 @@ from enum import Enum
 import requests
 
 from PyQt5.QtWidgets import QApplication, QTableWidgetItem, QWidget, QMessageBox, QInputDialog
-from PyQt5.QtGui import QPixmap, QImage
+from PyQt5.QtGui import QPixmap, QImage, QColor, QBrush
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5 import uic
 import torch
@@ -234,7 +234,7 @@ class BananaClass(Enum):
     C30TR   = "30TR"
     CF36TR  = "IF36TR"
     CIF38TR = "IF38TR"
-    UNKNOWN = "Not Classified"
+    UNKNOWN = "Out of Specification"
 
 CLASS_TO_BIN = {
     BananaClass.C33BCP:  1,
@@ -705,10 +705,13 @@ class PipelineThread(QThread):
         if not self.running:
             return
         if not ok or weight <= 0:
-            # Weight failed — skip plate, restart motor
             print(f"  [2] ✗ Weight fail — skipping plate#{p}")
             self.serial_reader.scale_event.clear()
             self.arduino.sendAssign(0)
+            job = {"plate": p, "bin": 0, "cls": "Out of Specification",
+                   "weight": -1, "finger": "-", "size": "-",
+                   "img": "", "farm": self.farm}
+            self.classified_signal.emit(job)
             self.error_signal.emit(f"Weight fail plate#{p}")
             return
         print(f"  [2] ✓ {weight:.1f}g")
@@ -723,6 +726,10 @@ class PipelineThread(QThread):
             print(f"  [3] ✗ YOLO fail — skipping plate#{p}")
             self.serial_reader.scale_event.clear()
             self.arduino.sendAssign(0)
+            job = {"plate": p, "bin": 0, "cls": "No Banana Detected",
+                   "weight": weight, "finger": "-", "size": "-",
+                   "img": det.get("image_path", ""), "farm": self.farm}
+            self.classified_signal.emit(job)
             self.error_signal.emit(f"YOLO fail plate#{p}")
             return
         print(f"  [3] ✓ {finger}  conf:{conf:.2f}")
@@ -1052,11 +1059,20 @@ class MainWindow(QWidget):
                 self.ui.lblImg.setPixmap(QPixmap.fromImage(qi))
         row = self.ui.tblResult.rowCount()
         self.ui.tblResult.insertRow(row)
-        vals = [job["cls"], f"{job['weight']:.1f}",
+        weight_str = f"{job['weight']:.1f}" if job["weight"] >= 0 else "-"
+        vals = [job["cls"], weight_str,
                 job["finger"], job["size"], str(job["bin"]) if job["bin"] else "-", job["farm"]]
         cols = min(len(vals), self.ui.tblResult.columnCount())
         for col in range(cols):
             self.ui.tblResult.setItem(row, col, QTableWidgetItem(vals[col]))
+        if not job["bin"]:
+            red   = QBrush(QColor(200, 60, 60))
+            white = QBrush(QColor(255, 255, 255))
+            for col in range(cols):
+                item = self.ui.tblResult.item(row, col)
+                if item:
+                    item.setBackground(red)
+                    item.setForeground(white)
         self.ui.tblResult.scrollToBottom()
         if job["bin"]:
             self.setWindowTitle(
