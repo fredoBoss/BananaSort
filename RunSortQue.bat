@@ -1,5 +1,13 @@
 @echo off
 title Banana Sorting Machine
+cls
+echo.
+echo 
+echo             BANANA SORTING MACHINE
+echo            ========================
+echo             Automated Grade Sorter
+echo   
+echo.
 cd /d "%~dp0"
 "C:\Users\alfre\AppData\Local\Programs\Python\Python311\python.exe" old/SortQue.py
 if %ERRORLEVEL% NEQ 0 (
