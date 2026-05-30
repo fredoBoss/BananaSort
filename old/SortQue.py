@@ -164,29 +164,30 @@ def waitForStableWeight(stop_flag=None) -> tuple:
 # ─────────────────────────────────────────────────────
 # DATABASE
 # ─────────────────────────────────────────────────────
-try:
-    db = mysql.connector.connect(
-        host="localhost", user="root",
-        password="Password1", database="grade"
-    )
-    print("Database: OK")
-except mysql.connector.Error as e:
-    print(f"Database: connection failed — {e}")
-    db = None
+DB_CONFIG = dict(host="localhost", user="root", password="Password1", database="grade")
+
+def _testDbConnection():
+    try:
+        c = mysql.connector.connect(**DB_CONFIG)
+        c.close()
+        print("Database: OK")
+        return True
+    except mysql.connector.Error as e:
+        print(f"Database: connection failed — {e}")
+        return False
+
+_testDbConnection()
 
 def saveToDatabase(farm, cls, weight, finger, size, conf, x1, y1, x2, y2):
-    if db is None:
-        print("  ✗ DB: not connected, skipping save")
-        return
     try:
-        db.ping(reconnect=True, attempts=3, delay=1)
-        cur = db.cursor()
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cur  = conn.cursor()
         cur.execute(
             """INSERT INTO finger_classes
                (Farm, Classes, weight, classes_name, size, conf, x1, y1, x2, y2)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (farm, cls, weight, finger, size, conf, x1, y1, x2, y2))
-        db.commit(); cur.close()
+        conn.commit(); cur.close(); conn.close()
         print(f"  ✓ DB: {cls}")
     except mysql.connector.Error as e:
         print(f"  ✗ DB error: {e}")
@@ -233,7 +234,7 @@ class BananaClass(Enum):
     C30TR   = "30TR"
     CF36TR  = "IF36TR"
     CIF38TR = "IF38TR"
-    UNKNOWN = "Invalid Classes"
+    UNKNOWN = "Not Classified"
 
 CLASS_TO_BIN = {
     BananaClass.C33BCP:  1,
@@ -812,6 +813,7 @@ class MainWindow(QWidget):
         self.ui.btnNext.clicked.connect(self.onNext)
         self.ui.btnTestServo.clicked.connect(self.onTestServo)
         self.ui.btnCheckSw.clicked.connect(self.onCheckLimitSw)
+        self.ui.btnClearTable.clicked.connect(self.onClearTable)
 
 
         self.ui.btnStart.setEnabled(False)
@@ -869,6 +871,9 @@ class MainWindow(QWidget):
             self.ui.btnCheckSw.setEnabled(True)
             self.setWindowTitle("Banana Sorter — Ready")
             print("App ready")
+
+    def onClearTable(self):
+        self.ui.tblResult.setRowCount(0)
 
     def onNext(self):
         if arduino:

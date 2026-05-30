@@ -86,13 +86,6 @@
                         </item>
                         <item row="2" column="1">
                             <layout class="QHBoxLayout" name="horizontalLayout_2">
-                                <!-- <item>
-                                    <widget class="QPushButton" name="btnTare">
-                                        <property name="text">
-                                            <string>Tare</string>
-                                        </property>
-                                    </widget>
-                                </item> -->
                                 <item>
                                     <widget class="QPushButton" name="btnStart">
                                         <property name="enabled">
@@ -120,6 +113,42 @@
                                         </property>
                                         <property name="toolTip">
                                             <string>Force-start motor (next:)</string>
+                                        </property>
+                                    </widget>
+                                </item>
+                                <item>
+                                    <widget class="QPushButton" name="btnTestServo">
+                                        <property name="enabled">
+                                            <bool>true</bool>
+                                        </property>
+                                        <property name="text">
+                                            <string>Test Servo</string>
+                                        </property>
+                                        <property name="toolTip">
+                                            <string>Fire a servo gate for testing (testServo:N)</string>
+                                        </property>
+                                    </widget>
+                                </item>
+                                <item>
+                                    <widget class="QPushButton" name="btnCheckSw">
+                                        <property name="enabled">
+                                            <bool>true</bool>
+                                        </property>
+                                        <property name="text">
+                                            <string>Check Switches</string>
+                                        </property>
+                                        <property name="toolTip">
+                                            <string>Read all 8 limit switch states (checkLimitSw:)</string>
+                                        </property>
+                                    </widget>
+                                </item>
+                                <item>
+                                    <widget class="QPushButton" name="btnClearTable">
+                                        <property name="text">
+                                            <string>Clear Table</string>
+                                        </property>
+                                        <property name="toolTip">
+                                            <string>Clear all rows from the result table</string>
                                         </property>
                                     </widget>
                                 </item>
