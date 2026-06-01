@@ -62,7 +62,7 @@ bool statusReady = false;   // tracks last uploaded Status to avoid redundant wr
 
 float emaWeight    = -1.0f;   // -1 = uninitialised
 float lastUploaded = -9999.f;
-const float EMA_ALPHA  = 0.25f;   // 25% new / 75% history — tune lower for more smoothing
+const float EMA_ALPHA  = 0.40f;   // 40% new / 60% history — faster settle (~4s to 95%)
 const float DEADBAND_G = 1.5f;    // skip Weight upload if change < this (grams)
 
 // ─────────────────────────────────────────────────────
