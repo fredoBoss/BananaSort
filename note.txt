@@ -1,0 +1,154 @@
+================================================================================
+NOTE: CV-Based Banana Hand Size Estimation (TO APPLY LATER)
+================================================================================
+Date noted: 2026-05-25
+Status: NOT YET IMPLEMENTED — apply when on machine
+
+--------------------------------------------------------------------------------
+PURPOSE
+--------------------------------------------------------------------------------
+Add a backup CV function that estimates banana hand size in physical inches
+directly from the YOLO segmentation masks. This is purely informational —
+it does NOT affect bin assignment, classification, or any existing logic.
+
+Intended for panel demo: "here is where we measure hand size using CV."
+
+--------------------------------------------------------------------------------
+SAFETY CONFIRMATION
+--------------------------------------------------------------------------------
+Adding this function will NOT affect classification because:
+  - It only READS best_result.masks.xy (already computed by YOLO, free data)
+  - It only WRITES new keys to the res dict (cv_size_inches, cv_size_label)
+  - classifyBanana(), inferHand(), parseFinger(), CLASS_TO_BIN are untouched
+  - _process_one_plate() reads det["finger"] only — new keys are invisible to it
+  - Bin assignment path is completely isolated
+  Verdict: purely additive, zero risk to existing pipeline.
+
+--------------------------------------------------------------------------------
+HOW THE FUNCTION WORKS
+--------------------------------------------------------------------------------
+Input:  masks_xy  — list of polygon arrays from best_result.masks.xy
+        pixels_per_inch — calibration constant (add to Config class)
+
+Steps:
+  1. Combine all mask polygon arrays into one flat NumPy point array
+     (covers all banana fingers in the hand)
+  2. Call cv2.minAreaRect() on the combined points
+     → returns (center, (width, height), angle) of the tightest rotated rect
+  3. Take max(width, height) as hand length in pixels
+     (minAreaRect handles any orientation — hand lying at any angle is correct)
+  4. Divide by pixels_per_inch → hand length in inches
+  5. Apply size label:
+       >= 6.0 inches  → "regular hand"
+       <= 5.5 inches  → "small hand"
+       5.5 < x < 6.0 → "ambiguous"   (don't force a label on borderline)
+
+Why minAreaRect and NOT the existing bounding box (x1,y1,x2,y2)?
+  The bounding box is axis-aligned — if the hand lies at an angle, the box
+  measures the diagonal, not the true length. minAreaRect rotates to fit
+  the actual orientation, giving the real physical length every time.
+
+--------------------------------------------------------------------------------
+WHERE TO INSERT IN CODE  (file: old/SortQue.py)
+--------------------------------------------------------------------------------
+Location: inside captureImage(), after line ~334 where best_result is resolved.
+
+  best_conf, best_box, best_frame, best_result = best_by_label.get(
+      winner, (0.0, None, None, None))
+
+  # <-- INSERT CALL HERE
+  # if best_result is not None and best_result.masks is not None:
+  #     cv_inches, cv_label = estimateHandSize(best_result.masks.xy,
+  #                                            Config.PIXELS_PER_INCH)
+  #     res["cv_size_inches"] = cv_inches
+  #     res["cv_size_label"]  = cv_label
+
+  res["finger"] = [best_conf, winner]   # <-- this line stays untouched
+
+The new function (estimateHandSize) can live right above captureImage()
+in the same file, near the other helper functions.
+
+--------------------------------------------------------------------------------
+CALIBRATION STEP (required before use)
+--------------------------------------------------------------------------------
+Must add to Config class:
+    PIXELS_PER_INCH = ???   # measure on machine
+
+How to calibrate:
+  1. Place a ruler or known-length object flat on the conveyor plate
+  2. Capture a frame while it sits at the scale/camera position
+  3. In the image, count how many pixels span a known inch distance
+     (use any image viewer or cv2.imshow + mouse coordinate readout)
+  4. PIXELS_PER_INCH = pixel_count / known_inches
+  5. Camera must NOT move after calibration — mount is fixed
+
+Note: one calibration lasts forever as long as camera position is unchanged.
+Can also calibrate with a known-size banana hand if ruler is not available.
+
+--------------------------------------------------------------------------------
+PERFORMANCE IMPACT
+--------------------------------------------------------------------------------
+Added time per plate: < 1 ms
+  - operates on already-allocated NumPy arrays (masks from YOLO)
+  - cv2.minAreaRect on ~100-250 points is near-instant
+  - no I/O, no network, no extra inference, no new threads
+
+For context, existing per-plate time:
+  - Weight settle wait (fixed):      1.0 s
+  - Firebase weight polling:         ~1.5 - 3.0 s
+  - YOLO inference x5 frames:        ~250 - 500 ms
+  - Frame flush delay:               ~300 ms
+  --> New function adds < 0.1% overhead. Negligible.
+
+Threading: runs synchronously on PipelineThread inside captureImage().
+No locks, no shared state, no new threads needed.
+
+--------------------------------------------------------------------------------
+SIZE THRESHOLDS
+--------------------------------------------------------------------------------
+  >= 6.0 inches  → "regular hand"
+  <= 5.5 inches  → "small hand"
+  5.5 - 6.0 in   → "ambiguous"
+
+These thresholds are independent of the weight-based HandSize from inferHand().
+Both can coexist in the job dict:
+  job["size"]          → from inferHand()         (weight-based, drives bin)
+  job["cv_size_label"] → from estimateHandSize()  (CV-based, informational only)
+
+--------------------------------------------------------------------------------
+ROUGH FUNCTION SKELETON (write this when on machine)
+--------------------------------------------------------------------------------
+
+def estimateHandSize(masks_xy, pixels_per_inch: float) -> tuple:
+    if not masks_xy or pixels_per_inch <= 0:
+        return -1.0, "unknown"
+    try:
+        all_pts = np.vstack([m for m in masks_xy if len(m) >= 3]).astype(np.float32)
+        _, (w, h), _ = cv2.minAreaRect(all_pts)
+        length_px     = max(w, h)
+        length_in     = length_px / pixels_per_inch
+        if length_in >= 6.0:
+            label = "regular hand"
+        elif length_in <= 5.5:
+            label = "small hand"
+        else:
+            label = "ambiguous"
+        return round(length_in, 2), label
+    except Exception as e:
+        print(f"  [estimateHandSize] {e}")
+        return -1.0, "unknown"
+
+--------------------------------------------------------------------------------
+DB / UI (optional, do after function works)
+--------------------------------------------------------------------------------
+- To show in UI table: add a column to resultUi.ui and include cv_size_label
+  in the vals list inside _onClassified()
+- To save to DB: add column cv_hand_size VARCHAR(20) to finger_classes table
+  and add the value to the saveToDatabase() INSERT
+
+Neither is required for the function to work — it just logs to console
+until you wire it up.
+
+================================================================================
+END OF NOTE
+================================================================================
