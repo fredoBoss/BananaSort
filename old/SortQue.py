@@ -75,9 +75,10 @@ class Config:
 
     WEIGHT_THRESHOLD_G  = 5.0
     WEIGHT_STABLE_N     = 4
-    WEIGHT_EMPTY_N      = 5       # consecutive sub-floor reads ⇒ empty / no-banana plate
+    WEIGHT_EMPTY_N      = 5       # consecutive near-zero reads ⇒ empty plate (fast reject)
     WEIGHT_TIMEOUT_S    = 20
-    MIN_VALID_WEIGHT_G  = 320.0  # lowest bin is 350g; blocks EMA ramp-up false-stable reads
+    MIN_VALID_WEIGHT_G  = 320.0  # lowest GRADE is 350g; lighter bananas are out-of-spec, not "empty"
+    EMPTY_MAX_G         = 50.0   # < this (near-zero) ⇒ truly empty plate; ≥ this ⇒ a banana is present → let YOLO classify it
     MAX_VALID_WEIGHT_G  = 1500.0
     WEIGHT_SETTLE_S     = 3.5   # EMA α=0.25 needs ~3s to converge after banana lands
 
@@ -148,34 +149,36 @@ def waitForStableWeight(stop_flag=None) -> tuple:
     """Poll Firebase for a stable plate weight.
 
     Returns (weight, status):
-      status "ok"      → stable valid reading (≥ MIN_VALID_WEIGHT_G); weight is the avg
-      status "empty"   → weight stayed stably below the lightest grade ⇒ no /
-                         too-light banana. Fast reject, no 20 s timeout.
+      status "ok"      → stable reading ≥ EMPTY_MAX_G; weight is the avg. This
+                         INCLUDES light single/double bananas that sit below the
+                         grading floor — they must still reach YOLO so it can
+                         count them and mark them "Out of Specification".
+      status "empty"   → weight stayed stably near zero (< EMPTY_MAX_G) ⇒ a truly
+                         empty plate. Fast reject, no 20 s timeout.
       status "timeout" → no stable reading within WEIGHT_TIMEOUT_S (sensor/Firebase issue)
 
-    The caller waits WEIGHT_SETTLE_S first, so a real banana's EMA has already
-    converged above MIN_VALID_WEIGHT_G by the time we poll — a sustained
-    sub-floor reading therefore means the plate is empty, not mid-ramp.
+    Banana *presence* is decided by YOLO, not by the grading weight floor — so
+    only a near-empty plate is rejected here.
     """
-    readings   = []
-    low_streak = 0
+    readings     = []
+    empty_streak = 0
     start = time.time()
     while (time.time() - start) < Config.WEIGHT_TIMEOUT_S:
         if stop_flag and stop_flag.is_set():
             return -1, "timeout"
         raw = getRawWeightFromFirebase()
         if raw is None or raw > Config.MAX_VALID_WEIGHT_G:
-            low_streak = 0          # unreadable / over-range — not an "empty" vote
+            empty_streak = 0        # unreadable / over-range — not an "empty" vote
             time.sleep(0.3); continue
-        if raw < Config.MIN_VALID_WEIGHT_G:
-            low_streak += 1
+        if raw < Config.EMPTY_MAX_G:
+            empty_streak += 1
             readings.clear()
-            if low_streak >= Config.WEIGHT_EMPTY_N:
-                print(f"  ✓ Empty plate: {low_streak} reads < "
-                      f"{Config.MIN_VALID_WEIGHT_G:.0f}g floor (last {raw:.1f}g)")
+            if empty_streak >= Config.WEIGHT_EMPTY_N:
+                print(f"  ✓ Empty plate: {empty_streak} reads < "
+                      f"{Config.EMPTY_MAX_G:.0f}g (last {raw:.1f}g)")
                 return -1, "empty"
             time.sleep(0.3); continue
-        low_streak = 0
+        empty_streak = 0
         readings.append(raw)
         if len(readings) > Config.WEIGHT_STABLE_N:
             readings.pop(0)
@@ -349,11 +352,16 @@ def captureImage(get_frame_fn) -> dict:
         count_masks  = [m for m, cf in zip(result.masks.xy, confs_all)
                         if len(m) >= 3 and float(cf) >= Config.CONF_THRESHOLD]
         banana_count = len(count_masks)
-        label        = {3:"3-finger",4:"4-finger",5:"5-finger"}.get(banana_count)
-        if label is None:
+        if banana_count == 0:
+            # masks seen (≥ PRESENCE_CONF) but none confident enough to count
             print(f"  Frame {i+1}: banana present ({len(present_masks)} mask) "
-                  f"but confident count={banana_count} — unreadable")
+                  f"but no confident finger — unreadable")
             time.sleep(Config.CAPTURE_INTERVAL_MS/1000); continue
+        # 3/4/5 are gradeable; 1, 2, 6+ are confidently counted but out of the
+        # gradeable range — label them generically so they still vote and flow
+        # to classify, which maps any non-3/4/5 finger to "Out of Specification".
+        label = {3:"3-finger",4:"4-finger",5:"5-finger"}.get(
+            banana_count, f"{banana_count}-finger")
         vote_counts[label] = vote_counts.get(label,0) + 1
         confs = confs_all
         if len(confs) > 0:
