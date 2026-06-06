@@ -62,7 +62,8 @@ print(f"Using device: {device.upper()}")
 # CONFIG
 # ─────────────────────────────────────────────────────
 class Config:
-    CONF_THRESHOLD      = 0.75
+    CONF_THRESHOLD      = 0.75   # min conf to COUNT a finger (3/4/5 grading)
+    PRESENCE_CONF       = 0.35   # min conf to say "a banana is present at all"
     IOU_THRESHOLD       = 0.60
     MASK_ALPHA          = 0.50
     CAPTURE_FRAMES      = 5
@@ -74,6 +75,7 @@ class Config:
 
     WEIGHT_THRESHOLD_G  = 5.0
     WEIGHT_STABLE_N     = 4
+    WEIGHT_EMPTY_N      = 5       # consecutive sub-floor reads ⇒ empty / no-banana plate
     WEIGHT_TIMEOUT_S    = 20
     MIN_VALID_WEIGHT_G  = 320.0  # lowest bin is 350g; blocks EMA ramp-up false-stable reads
     MAX_VALID_WEIGHT_G  = 1500.0
@@ -114,40 +116,67 @@ def testFirebaseConnection():
     return firebase_connected
 
 
-def getWeightFromFirebase() -> float:
+def getRawWeightFromFirebase():
+    """Raw weight reading with no validity gating.
+       Returns grams (float), or None if Firebase couldn't be read.
+       Needed so waitForStableWeight can tell a stable *low* reading
+       (empty/too-light plate) apart from a missing/failed read."""
     for attempt in range(Config.FIREBASE_RETRY):
         try:
             r = requests.get(f"{Config.FIREBASE_URL}/Weight.json",
                             timeout=Config.FIREBASE_TIMEOUT_S)
             if r.status_code == 200 and r.json() is not None:
-                w = float(r.json())
-                if Config.MIN_VALID_WEIGHT_G <= w <= Config.MAX_VALID_WEIGHT_G:
-                    return w
-                return -1
+                return float(r.json())
         except requests.exceptions.Timeout:
             print(f"  Firebase timeout ({attempt+1}/{Config.FIREBASE_RETRY})")
         except Exception as e:
             print(f"  Firebase error: {e}")
         if attempt < Config.FIREBASE_RETRY - 1:
             time.sleep(0.3)
+    return None
+
+
+def getWeightFromFirebase() -> float:
+    raw = getRawWeightFromFirebase()
+    if raw is None:
+        return -1
+    if Config.MIN_VALID_WEIGHT_G <= raw <= Config.MAX_VALID_WEIGHT_G:
+        return raw
     return -1
 
 def waitForStableWeight(stop_flag=None) -> tuple:
-    readings, zero_streak = [], 0
+    """Poll Firebase for a stable plate weight.
+
+    Returns (weight, status):
+      status "ok"      → stable valid reading (≥ MIN_VALID_WEIGHT_G); weight is the avg
+      status "empty"   → weight stayed stably below the lightest grade ⇒ no /
+                         too-light banana. Fast reject, no 20 s timeout.
+      status "timeout" → no stable reading within WEIGHT_TIMEOUT_S (sensor/Firebase issue)
+
+    The caller waits WEIGHT_SETTLE_S first, so a real banana's EMA has already
+    converged above MIN_VALID_WEIGHT_G by the time we poll — a sustained
+    sub-floor reading therefore means the plate is empty, not mid-ramp.
+    """
+    readings   = []
+    low_streak = 0
     start = time.time()
     while (time.time() - start) < Config.WEIGHT_TIMEOUT_S:
         if stop_flag and stop_flag.is_set():
-            return -1, False
-        w = getWeightFromFirebase()
-        if w < 0:
+            return -1, "timeout"
+        raw = getRawWeightFromFirebase()
+        if raw is None or raw > Config.MAX_VALID_WEIGHT_G:
+            low_streak = 0          # unreadable / over-range — not an "empty" vote
             time.sleep(0.3); continue
-        if w < Config.MIN_VALID_WEIGHT_G:
-            zero_streak += 1
-            if zero_streak >= 4:
-                readings.clear(); zero_streak = 0
+        if raw < Config.MIN_VALID_WEIGHT_G:
+            low_streak += 1
+            readings.clear()
+            if low_streak >= Config.WEIGHT_EMPTY_N:
+                print(f"  ✓ Empty plate: {low_streak} reads < "
+                      f"{Config.MIN_VALID_WEIGHT_G:.0f}g floor (last {raw:.1f}g)")
+                return -1, "empty"
             time.sleep(0.3); continue
-        zero_streak = 0
-        readings.append(w)
+        low_streak = 0
+        readings.append(raw)
         if len(readings) > Config.WEIGHT_STABLE_N:
             readings.pop(0)
         if len(readings) == Config.WEIGHT_STABLE_N:
@@ -155,10 +184,10 @@ def waitForStableWeight(stop_flag=None) -> tuple:
             if variation <= Config.WEIGHT_THRESHOLD_G:
                 avg = sum(readings) / len(readings)
                 print(f"  ✓ Weight: {avg:.1f}g  (var {variation:.1f}g)")
-                return avg, True
+                return avg, "ok"
         time.sleep(0.3)
     print("  ✗ Weight timeout")
-    return -1, False
+    return -1, "timeout"
 
 
 # ─────────────────────────────────────────────────────
@@ -289,29 +318,44 @@ COLORS = [
 ]
 
 def captureImage(get_frame_fn) -> dict:
-    res = {"finger":[-1,"invalid"],"x1":0,"y1":0,"x2":0,"y2":0,"image_path":""}
+    res = {"finger":[-1,"invalid"],"status":"no_banana",
+           "x1":0,"y1":0,"x2":0,"y2":0,"image_path":""}
     for _ in range(Config.FLUSH_FRAMES):
         get_frame_fn(); time.sleep(Config.FLUSH_DELAY_MS/1000)
 
     vote_counts = {}
     best_by_label = {}   # label → (conf, box, frame, result)
+    frames_read        = 0   # frames grabbed from the camera (ret == True)
+    frames_with_banana = 0   # frames where YOLO found ≥1 banana mask (any count)
 
     for i in range(Config.CAPTURE_FRAMES):
         ret, frame = get_frame_fn()
         if not ret or frame is None:
             time.sleep(Config.CAPTURE_INTERVAL_MS/1000); continue
-        result = model.predict(source=frame, conf=Config.CONF_THRESHOLD,
+        frames_read += 1
+        # Detect at the low PRESENCE_CONF so even a faint/occluded banana
+        # registers — this is the dedicated "banana vs no-banana" check.
+        result = model.predict(source=frame, conf=Config.PRESENCE_CONF,
                                iou=Config.IOU_THRESHOLD, save=False, verbose=False)[0]
         if result.masks is None or len(result.masks.xy) == 0:
+            # Nothing at all, even at low conf → empty plate for this frame.
             time.sleep(Config.CAPTURE_INTERVAL_MS/1000); continue
-        valid_masks  = [m for m in result.masks.xy if len(m) >= 3]
-        banana_count = len(valid_masks)
+        confs_all     = result.boxes.conf
+        present_masks = [m for m in result.masks.xy if len(m) >= 3]
+        if not present_masks:
+            time.sleep(Config.CAPTURE_INTERVAL_MS/1000); continue
+        frames_with_banana += 1   # a banana IS on the plate (≥ PRESENCE_CONF)
+        # Count fingers using only confident masks (≥ CONF_THRESHOLD).
+        count_masks  = [m for m, cf in zip(result.masks.xy, confs_all)
+                        if len(m) >= 3 and float(cf) >= Config.CONF_THRESHOLD]
+        banana_count = len(count_masks)
         label        = {3:"3-finger",4:"4-finger",5:"5-finger"}.get(banana_count)
         if label is None:
-            print(f"  Frame {i+1}: count={banana_count} outside range")
+            print(f"  Frame {i+1}: banana present ({len(present_masks)} mask) "
+                  f"but confident count={banana_count} — unreadable")
             time.sleep(Config.CAPTURE_INTERVAL_MS/1000); continue
         vote_counts[label] = vote_counts.get(label,0) + 1
-        confs = result.boxes.conf
+        confs = confs_all
         if len(confs) > 0:
             idx = int(confs.argmax()); conf_val = float(confs[idx])
             prev = best_by_label.get(label)
@@ -322,19 +366,33 @@ def captureImage(get_frame_fn) -> dict:
         print(f"  Frame {i+1}: {label}  conf={float(confs.max()):.2f}")
         time.sleep(Config.CAPTURE_INTERVAL_MS/1000)
 
+    if frames_read == 0:
+        print("  ✗ Camera read failed — no frames")
+        res["status"] = "camera_fail"; return res
     if not vote_counts:
-        print("  ✗ No detections"); return res
+        # YOLO ran but never produced a usable 3/4/5 finger count.
+        # Use mask presence to tell "empty plate" from "unreadable banana".
+        if frames_with_banana > 0:
+            print("  ✗ Banana present but finger count unreadable")
+            res["status"] = "detect_fail"
+        else:
+            print("  ✗ No banana detected on plate")
+            res["status"] = "no_banana"
+        return res
     winner    = max(vote_counts, key=vote_counts.get)
     win_votes = vote_counts[winner]
     total     = sum(vote_counts.values())
     print(f"  Votes: {vote_counts} → {winner} ({win_votes}/{total})")
     if win_votes < Config.MIN_VALID_FRAMES:
-        print(f"  ✗ Weak consensus"); return res
+        # We had valid counts, just not enough agreement — banana is present.
+        print(f"  ✗ Weak consensus — banana seen, count unstable")
+        res["status"] = "detect_fail"; return res
 
     best_conf, best_box, best_frame, best_result = best_by_label.get(
         winner, (0.0, None, None, None))
 
     res["finger"] = [best_conf, winner]
+    res["status"] = "ok"
     if best_box:
         res["x1"],res["y1"] = best_box[0],best_box[1]
         res["x2"],res["y2"] = best_box[2],best_box[3]
@@ -343,17 +401,18 @@ def captureImage(get_frame_fn) -> dict:
         overlay = best_frame.copy()
         ann = best_result   # reuse cached result — no second inference
         if ann.masks is not None:
-            for idx,(mpts,box,c) in enumerate(
-                    zip(ann.masks.xy,ann.boxes.xyxy,ann.boxes.conf)):
-                if len(mpts) < 3: continue
-                color = COLORS[idx % len(COLORS)]
+            shown = 0   # only draw/number confident fingers (matches the count)
+            for mpts, c in zip(ann.masks.xy, ann.boxes.conf):
+                if len(mpts) < 3 or float(c) < Config.CONF_THRESHOLD: continue
+                color = COLORS[shown % len(COLORS)]
+                shown += 1
                 pts   = mpts.astype(np.int32).reshape((-1,1,2))
                 cv2.fillPoly(overlay,[pts],color)
                 cv2.polylines(best_frame,[pts],True,color,2)
                 cx,cy = int(mpts[:,0].mean()),int(mpts[:,1].mean())
                 cv2.circle(best_frame,(cx,cy),14,color,-1)
                 cv2.circle(best_frame,(cx,cy),14,(255,255,255),2)
-                num = str(idx+1)
+                num = str(shown)
                 (tw,th),_ = cv2.getTextSize(num,cv2.FONT_HERSHEY_SIMPLEX,0.40,2)
                 cv2.putText(best_frame,num,(cx-tw//2,cy+th//2),
                             cv2.FONT_HERSHEY_SIMPLEX,0.40,(0,0,0),2)
@@ -701,18 +760,26 @@ class PipelineThread(QThread):
         if not self.running:
             return
         print(f"  [2] Weighing…")
-        weight, ok = waitForStableWeight(self._stop_flag)
+        weight, wstatus = waitForStableWeight(self._stop_flag)
         if not self.running:
             return
-        if not ok or weight <= 0:
-            print(f"  [2] ✗ Weight fail — skipping plate#{p}")
+        if wstatus != "ok":
+            # "empty"  → plate weight stayed below the lightest grade: no /
+            #            too-light banana — fast reject without the 20 s timeout.
+            # "timeout"→ Firebase/scale never produced a stable reading.
+            if wstatus == "empty":
+                cls_label = "No Banana Detected"
+                print(f"  [2] ✗ No banana on plate (sub-floor weight) — skipping plate#{p}")
+            else:
+                cls_label = "Weight Read Failed"
+                print(f"  [2] ✗ Weight read failed — skipping plate#{p}")
             self.serial_reader.scale_event.clear()
             self.arduino.sendAssign(0)
-            job = {"plate": p, "bin": 0, "cls": "Out of Specification",
+            job = {"plate": p, "bin": 0, "cls": cls_label,
                    "weight": -1, "finger": "-", "size": "-",
                    "img": "", "farm": self.farm}
             self.classified_signal.emit(job)
-            self.error_signal.emit(f"Weight fail plate#{p}")
+            self.error_signal.emit(f"{cls_label} plate#{p}")
             return
         print(f"  [2] ✓ {weight:.1f}g")
 
@@ -723,14 +790,22 @@ class PipelineThread(QThread):
         finger = det["finger"][1]
         conf   = det["finger"][0]
         if finger == "invalid":
-            print(f"  [3] ✗ YOLO fail — skipping plate#{p}")
+            # YOLO is the banana-presence check: distinguish a genuinely empty
+            # plate ("No Banana Detected") from a banana it couldn't read
+            # ("Detection Failed") or a dead camera ("Camera Read Failed").
+            cls_label = {
+                "no_banana":   "No Banana Detected",
+                "detect_fail": "Detection Failed",
+                "camera_fail": "Camera Read Failed",
+            }.get(det.get("status", "no_banana"), "Detection Failed")
+            print(f"  [3] ✗ {cls_label} — skipping plate#{p}")
             self.serial_reader.scale_event.clear()
             self.arduino.sendAssign(0)
-            job = {"plate": p, "bin": 0, "cls": "No Banana Detected",
+            job = {"plate": p, "bin": 0, "cls": cls_label,
                    "weight": weight, "finger": "-", "size": "-",
                    "img": det.get("image_path", ""), "farm": self.farm}
             self.classified_signal.emit(job)
-            self.error_signal.emit(f"YOLO fail plate#{p}")
+            self.error_signal.emit(f"{cls_label} plate#{p}")
             return
         print(f"  [3] ✓ {finger}  conf:{conf:.2f}")
 
@@ -1066,6 +1141,11 @@ class MainWindow(QWidget):
             qi = QImage(job["img"])
             if not qi.isNull():
                 self.ui.lblImg.setPixmap(QPixmap.fromImage(qi))
+        elif not job["bin"]:
+            # Reject with no annotated capture — drop any stale still so the
+            # image panel doesn't sit there contradicting the reject row.
+            self.ui.lblImg.clear()
+            self.ui.lblImg.setText("No Image")
         row = self.ui.tblResult.rowCount()
         self.ui.tblResult.insertRow(row)
         weight_str = f"{job['weight']:.1f}" if job["weight"] >= 0 else "-"
