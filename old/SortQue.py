@@ -809,6 +809,15 @@ class MainWindow(QWidget):
         self.setWindowTitle("Banana Sorter — Starting…")
         self.showMaximized()
 
+        # Compact result table rows (header/cell fonts come from the .ui stylesheet)
+        self.ui.tblResult.verticalHeader().setDefaultSectionSize(28)
+        self.ui.tblResult.verticalHeader().setVisible(False)
+        # Distribute every column evenly across the table width so each header
+        # sits in its own equal share — no single column balloons to absorb the gap.
+        from PyQt5.QtWidgets import QHeaderView
+        _hdr = self.ui.tblResult.horizontalHeader()
+        _hdr.setSectionResizeMode(QHeaderView.Stretch)
+
         self.pipeline_thread = None
         self.serial_reader   = None
         self._startup_ok     = False
