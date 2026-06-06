@@ -177,9 +177,20 @@
                                 </property>
                                 <property name="maximumSize">
                                     <size>
-                                        <width>500</width>
+                                        <width>820</width>
                                         <height>16777215</height>
                                     </size>
+                                </property>
+                                <property name="styleSheet">
+                                    <string notr="true">QHeaderView::section {
+    font-size: 20px;
+    font-weight: bold;
+    padding: 2px 4px;
+}
+QTableWidget::item {
+    font-size: 20px;
+    padding: 2px 4px;
+}</string>
                                 </property>
                                 <column>
                                     <property name="text">
