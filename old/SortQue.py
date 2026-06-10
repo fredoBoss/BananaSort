@@ -809,8 +809,11 @@ class PipelineThread(QThread):
             print(f"  [3] ✗ {cls_label} — skipping plate#{p}")
             self.serial_reader.scale_event.clear()
             self.arduino.sendAssign(0)
+            # "No banana" means no meaningful weight to report → show a dash.
+            # "Detection Failed"/"Camera Read Failed" keep the weight (banana present).
+            rpt_weight = -1 if cls_label == "No Banana Detected" else weight
             job = {"plate": p, "bin": 0, "cls": cls_label,
-                   "weight": weight, "finger": "-", "size": "-",
+                   "weight": rpt_weight, "finger": "-", "size": "-",
                    "img": det.get("image_path", ""), "farm": self.farm}
             self.classified_signal.emit(job)
             self.error_signal.emit(f"{cls_label} plate#{p}")
