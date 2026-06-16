@@ -62,6 +62,12 @@ print(f"Using device: {device.upper()}")
 # CONFIG
 # ─────────────────────────────────────────────────────
 class Config:
+    """All tuneable constants in one place.
+
+    Hardware-linked values (ARDUINO_PORT, FIREBASE_URL) must match the physical
+    deployment.  Threshold values (CONF_THRESHOLD, WEIGHT_THRESHOLD_G, etc.) were
+    tuned empirically and should only be changed after hardware calibration.
+    """
     CONF_THRESHOLD      = 0.75   # min conf to COUNT a finger (3/4/5 grading)
     PRESENCE_CONF       = 0.35   # min conf to say "a banana is present at all"
     IOU_THRESHOLD       = 0.60
@@ -105,6 +111,7 @@ class Config:
 firebase_connected = False
 
 def testFirebaseConnection():
+    """Ping Firebase RTDB root; sets firebase_connected flag. Returns bool."""
     global firebase_connected
     try:
         r = requests.get(f"{Config.FIREBASE_URL}/.json",
@@ -118,10 +125,7 @@ def testFirebaseConnection():
 
 
 def getRawWeightFromFirebase():
-    """Raw weight reading with no validity gating.
-       Returns grams (float), or None if Firebase couldn't be read.
-       Needed so waitForStableWeight can tell a stable *low* reading
-       (empty/too-light plate) apart from a missing/failed read."""
+    """Fetch raw weight (grams) from Firebase with no validity gating; returns None on failure."""
     for attempt in range(Config.FIREBASE_RETRY):
         try:
             r = requests.get(f"{Config.FIREBASE_URL}/Weight.json",
@@ -138,6 +142,7 @@ def getRawWeightFromFirebase():
 
 
 def getWeightFromFirebase() -> float:
+    """Return weight in grams if within valid hardware range, otherwise -1."""
     raw = getRawWeightFromFirebase()
     if raw is None:
         return -1
@@ -146,20 +151,7 @@ def getWeightFromFirebase() -> float:
     return -1
 
 def waitForStableWeight(stop_flag=None) -> tuple:
-    """Poll Firebase for a stable plate weight.
-
-    Returns (weight, status):
-      status "ok"      → stable reading ≥ EMPTY_MAX_G; weight is the avg. This
-                         INCLUDES light single/double bananas that sit below the
-                         grading floor — they must still reach YOLO so it can
-                         count them and mark them "Out of Specification".
-      status "empty"   → weight stayed stably near zero (< EMPTY_MAX_G) ⇒ a truly
-                         empty plate. Fast reject, no 20 s timeout.
-      status "timeout" → no stable reading within WEIGHT_TIMEOUT_S (sensor/Firebase issue)
-
-    Banana *presence* is decided by YOLO, not by the grading weight floor — so
-    only a near-empty plate is rejected here.
-    """
+    """Poll Firebase until weight is stable; returns (weight, status) where status is 'ok', 'empty', or 'timeout'."""
     readings     = []
     empty_streak = 0
     start = time.time()
@@ -199,6 +191,7 @@ def waitForStableWeight(stop_flag=None) -> tuple:
 DB_CONFIG = dict(host="localhost", user="root", password="Password1", database="grade")
 
 def _testDbConnection():
+    """Test MySQL connection at startup and log the result."""
     try:
         c = mysql.connector.connect(**DB_CONFIG)
         c.close()
@@ -211,6 +204,7 @@ def _testDbConnection():
 _testDbConnection()
 
 def saveToDatabase(farm, cls, weight, finger, size, conf, x1, y1, x2, y2):
+    """INSERT one classification result row into the finger_classes MySQL table."""
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         cur  = conn.cursor()
@@ -232,6 +226,12 @@ model:   YOLO | None                 = None
 arduino: arduinoCommunication | None = None
 
 def loadModel():
+    """Load the YOLOv8 segmentation model and run one warm-up inference.
+
+    The first real call to model.predict() triggers PyTorch JIT compilation,
+    which takes 5–10 s.  Running a dummy inference here absorbs that latency
+    at startup so the first plate's classification is not delayed.
+    """
     global model
     model = YOLO("weights/segment1.pt")
     dummy = np.zeros((640, 640, 3), dtype=np.uint8)
@@ -240,6 +240,11 @@ def loadModel():
     print("YOLO model loaded and warmed up")
 
 def startArduino():
+    """Open serial connection to the Arduino Mega on Config.ARDUINO_PORT.
+
+    Raises on failure (port not found, permission denied) so StartupThread can
+    report the error to the UI and keep the Start button disabled.
+    """
     global arduino
     arduino = arduinoCommunication(Config.ARDUINO_PORT, Config.ARDUINO_BAUD)
     print("Arduino: OK")
@@ -249,17 +254,28 @@ def startArduino():
 # CLASSIFICATION ENUMS & LOGIC
 # ─────────────────────────────────────────────────────
 class FingerCount(Enum):
+    """Number of banana fingers detected by YOLO on the current plate."""
     THREE   = "3-finger"
     FOUR    = "4-finger"
     FIVE    = "5-finger"
     UNKNOWN = "unknown"
 
 class HandSize(Enum):
+    """Physical size category determined by weight within a finger-count band.
+
+    SMALL only applies to 4/5-finger bananas in the 33BCP weight range (400–520 g).
+    All 3-finger grades are classified as REGULAR regardless of weight.
+    """
     REGULAR = "regular"
     SMALL   = "small"
     UNKNOWN = "unknown"
 
 class BananaClass(Enum):
+    """Final commercial grade assigned to the banana hand, mapping to a physical sort bin.
+
+    UNKNOWN means the finger/weight combination is outside all grade specifications;
+    the plate is skipped (assign:0) and the conveyor continues without a servo drop.
+    """
     C25BCP  = "25BCP"
     C30BCP  = "30BCP"
     C33BCP  = "33BCP"
@@ -278,6 +294,11 @@ CLASS_TO_BIN = {
 }
 
 def parseFinger(label: str) -> FingerCount:
+    """Convert a YOLO class-name string (e.g. '3-finger') to a FingerCount enum.
+
+    Matches on the digit so label variants like '3finger', '3 finger', '3-Finger'
+    all work.  Returns UNKNOWN for anything not containing 3, 4, or 5.
+    """
     s = str(label).strip().lower()
     if "3" in s: return FingerCount.THREE
     if "4" in s: return FingerCount.FOUR
@@ -285,6 +306,11 @@ def parseFinger(label: str) -> FingerCount:
     return FingerCount.UNKNOWN
 
 def inferHand(finger: FingerCount, weight: float) -> HandSize:
+    """Determine HandSize from finger count and plate weight.
+
+    Returns UNKNOWN if the weight falls outside every expected range for the given
+    finger count, which causes classifyBanana to return BananaClass.UNKNOWN (skip).
+    """
     c = Config
     if finger == FingerCount.THREE:
         if c.W_IF38TR_MIN <= weight <= c.W_30TR_MAX: return HandSize.REGULAR
@@ -295,6 +321,12 @@ def inferHand(finger: FingerCount, weight: float) -> HandSize:
     return HandSize.UNKNOWN
 
 def classifyBanana(finger: FingerCount, weight: float):
+    """Map finger count + weight to a BananaClass grade and HandSize.
+
+    Returns (BananaClass, HandSize).  Finger count is checked first because it
+    selects which weight table to apply (BCP vs TR).  BananaClass.UNKNOWN means
+    the combination is outside all grade specs — caller sends assign:0 to skip.
+    """
     if finger == FingerCount.UNKNOWN:
         return BananaClass.UNKNOWN, HandSize.UNKNOWN
     hand = inferHand(finger, weight)
@@ -321,6 +353,17 @@ COLORS = [
 ]
 
 def captureImage(get_frame_fn) -> dict:
+    """Capture CAPTURE_FRAMES camera frames, run YOLO on each, and majority-vote the finger count.
+
+    Two-threshold strategy:
+      PRESENCE_CONF (0.35) — any mask above this means a banana is physically on the plate.
+      CONF_THRESHOLD (0.75) — only masks above this count toward the finger total.
+    This separates "is something there?" from "how many fingers?" so a partially
+    occluded hand is detected as present even if we can't count it confidently.
+
+    Returns a dict with keys: finger [conf, label], status, x1/y1/x2/y2, image_path.
+    status values: "ok", "no_banana", "detect_fail", "camera_fail".
+    """
     res = {"finger":[-1,"invalid"],"status":"no_banana",
            "x1":0,"y1":0,"x2":0,"y2":0,"image_path":""}
     for _ in range(Config.FLUSH_FRAMES):
@@ -440,10 +483,21 @@ def captureImage(get_frame_fn) -> dict:
 # STARTUP THREAD — loads model/firebase/arduino off the main thread
 # ─────────────────────────────────────────────────────
 class StartupThread(QThread):
+    """Loads the YOLO model, checks Firebase, and opens the Arduino serial port off the main thread.
+
+    Running these tasks in the background keeps the UI responsive during the ~5–10 s
+    startup window.  Emits ready_signal with a dict of pass/fail results so
+    MainWindow can decide whether to unlock the Start button or show a fatal error.
+    """
     status_signal = pyqtSignal(str)
     ready_signal  = pyqtSignal(object)  # dict: model/firebase/arduino → bool
 
     def run(self):
+        """Load model → check Firebase → open Arduino, emitting status_signal at each step.
+
+        Continues even if Firebase fails (non-fatal warning) but stops Start button
+        if model or Arduino fails (fatal — sorting is impossible without them).
+        """
         results = {'model': False, 'firebase': False, 'arduino': False}
 
         self.status_signal.emit("Loading YOLO model…")
@@ -476,6 +530,13 @@ class StartupThread(QThread):
 # WEIGHT POLLER THREAD
 # ─────────────────────────────────────────────────────
 class WeightPollerThread(QThread):
+    """Polls Firebase /Weight.json every 300 ms to drive the live weight label in the UI.
+
+    Independent of the pipeline — runs from app open to close.  Uses a separate
+    2 s HTTP timeout (shorter than the pipeline's FIREBASE_TIMEOUT_S) so a slow
+    Firebase response never blocks this display-only thread for long.
+    Emits weight_signal(-1.0) when the read fails so the UI shows '--'.
+    """
     weight_signal = pyqtSignal(float)   # -1.0 = no reading
 
     def __init__(self):
@@ -483,6 +544,7 @@ class WeightPollerThread(QThread):
         self.running = True
 
     def run(self):
+        """Poll Firebase continuously until stop() is called."""
         while self.running:
             w = -1.0
             try:
@@ -495,6 +557,7 @@ class WeightPollerThread(QThread):
             self.msleep(300)
 
     def stop(self):
+        """Signal the polling loop to exit and wait up to 2 s for clean shutdown."""
         self.running = False
         self.wait(2000)
 
@@ -503,6 +566,17 @@ class WeightPollerThread(QThread):
 # VIDEO THREAD
 # ─────────────────────────────────────────────────────
 class VideoThread(QThread):
+    """Reads the USB camera at ~30 fps and shares frames thread-safely.
+
+    Two paths out of this thread:
+      frame_signal  → Qt main thread (live preview label, always latest frame)
+      get_latest_frame() → called by PipelineThread to grab frames for YOLO
+
+    A threading.Lock protects _frame so PipelineThread and the Qt event loop
+    never see a partially-written numpy array from a concurrent write.
+    The pipeline does not start until ready_signal fires after the 8-frame warm-up,
+    ensuring no cold-camera frames (dark/blurry) reach YOLO.
+    """
     frame_signal = pyqtSignal(np.ndarray)
     error_signal = pyqtSignal(str)
     ready_signal = pyqtSignal()   # emitted after camera warm-up succeeds
@@ -514,12 +588,22 @@ class VideoThread(QThread):
         self._lock   = threading.Lock()
 
     def get_latest_frame(self):
+        """Return (True, frame_copy) or (False, None) if no frame is available yet.
+
+        Thread-safe snapshot.  The copy prevents PipelineThread from operating
+        on a frame that VideoThread.run() is about to overwrite.
+        """
         with self._lock:
             if self._frame is not None: return True, self._frame.copy()
         return False, None
 
     @staticmethod
     def _zoom(frame, factor):
+        """Centre-crop then upscale to simulate optical zoom without changing focus distance.
+
+        Increases the apparent banana size relative to the frame, giving YOLO larger
+        segmentation masks per finger.  factor=1.0 is a no-op (identity pass-through).
+        """
         if factor <= 1.0: return frame
         h, w = frame.shape[:2]
         ch, cw = int(h / factor), int(w / factor)
@@ -527,6 +611,12 @@ class VideoThread(QThread):
         return cv2.resize(frame[y0:y0+ch, x0:x0+cw], (w, h), interpolation=cv2.INTER_LINEAR)
 
     def run(self):
+        """Warm up the camera (8 frames) then stream at ~30 fps until stopped.
+
+        The 8-frame warm-up gives AGC and AWB time to settle before ready_signal
+        fires.  The pipeline waits for ready_signal so no underexposed or blurry
+        warm-up frames ever reach YOLO.
+        """
         cam = cv2.VideoCapture(0)
         cam.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
         cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 640)
@@ -561,7 +651,9 @@ class VideoThread(QThread):
         cam.release()
         print("VideoThread stopped")
 
-    def stop(self): self.running = False; self.wait()
+    def stop(self):
+        """Signal the capture loop to exit and block until the thread finishes."""
+        self.running = False; self.wait()
 
 
 # ─────────────────────────────────────────────────────
@@ -570,6 +662,13 @@ class VideoThread(QThread):
 # Sends checkLimitSw:, reads up to 8 "Limit Switch" lines, emits result.
 # ─────────────────────────────────────────────────────
 class LimitSwCheckThread(QThread):
+    """One-shot reader for the Arduino's checkLimitSw: response when the pipeline is stopped.
+
+    When the pipeline IS running, SerialReaderThread already owns the serial port and
+    handles the 8 "Limit Switch" response lines.  This thread is only spawned when
+    the user clicks 'Check Switches' with no pipeline active — it reads up to 8 lines
+    then emits result_signal and exits cleanly.
+    """
     result_signal = pyqtSignal(list)
 
     def __init__(self, serial_comm):
@@ -577,6 +676,7 @@ class LimitSwCheckThread(QThread):
         self.serial_comm = serial_comm
 
     def run(self):
+        """Read up to 8 'Limit Switch' lines within 5 s and emit them as a list."""
         lines = []
         start = time.time()
         while len(lines) < 8 and (time.time() - start) < 5.0:
@@ -609,6 +709,16 @@ class LimitSwCheckThread(QThread):
 # (Firebase polling, YOLO) never blocks incoming Arduino messages.
 # ─────────────────────────────────────────────────────
 class SerialReaderThread(QThread):
+    """Dedicated thread that owns the serial read path while the pipeline is running.
+
+    Keeping serial reading separate from PipelineThread ensures Firebase polling,
+    YOLO inference, and DB writes never delay incoming Arduino messages.
+    Token routing:
+      SCALE_STOP       → scale_event.set()          (wakes PipelineThread.wait)
+      PLATE_IN_BIN:N   → plate_sorted_signal(N)     (FIFO job dequeue + UI update)
+      BIN_CLICK:N,…    → pretty-printed progress bar to console
+      Limit Switch …   → accumulates 8 lines, emits limit_sw_signal for the dialog
+    """
     plate_sorted_signal = pyqtSignal(int)    # bin number
     limit_sw_signal     = pyqtSignal(list)   # list of 8 raw "Limit Switch …" lines
 
@@ -620,6 +730,12 @@ class SerialReaderThread(QThread):
         self._sw_lines    = []                 # accumulator for checkLimitSw: response
 
     def run(self):
+        """Poll in_waiting with a 20 ms sleep and route each received token.
+
+        Does NOT call readline() without checking in_waiting first — readline()
+        blocks for the full 2 s serial timeout when the Arduino is idle, which
+        would stall scale_event.set() and delay every plate's classification.
+        """
         while self.running:
             try:
                 if self.serial_comm.in_waiting > 0:
@@ -667,6 +783,7 @@ class SerialReaderThread(QThread):
         print("SerialReaderThread stopped")
 
     def stop(self):
+        """Signal the read loop to exit and block until the thread finishes."""
         self.running = False
         self.wait()
 
@@ -690,6 +807,17 @@ class SerialReaderThread(QThread):
 # servo gate.  "sorted_signal" fires when Arduino sends PLATE_IN_BIN:N.
 # ─────────────────────────────────────────────────────
 class PipelineThread(QThread):
+    """Core classify-then-sort loop — one full iteration per plate at the scale station.
+
+    Waits for SCALE_STOP from SerialReaderThread, weighs via Firebase, runs YOLO,
+    classifies, saves to MySQL, sends assign:N, and emits classified_signal.  After
+    assign:N the sort is fully autonomous: the Arduino counts bin-switch clicks and
+    fires the servo gate without any further Python involvement.
+
+    Multiple plates are on the conveyor simultaneously.  _active_jobs (dict[bin→list])
+    tracks in-transit plates so on_plate_sorted() can match each PLATE_IN_BIN:N
+    signal to the correct job using FIFO ordering.
+    """
     classified_signal = pyqtSignal(dict)
     sorted_signal     = pyqtSignal(dict)   # fired by _on_plate_sorted
     error_signal      = pyqtSignal(str)
@@ -710,8 +838,13 @@ class PipelineThread(QThread):
         self._active_jobs: dict[int, list] = {}   # bin_num → [job, ...]
         self._jobs_lock    = threading.Lock()
 
-    def pause(self):  self._paused = True
-    def resume(self): self._paused = False
+    def pause(self):
+        """Suspend plate processing between iterations (motor continues running)."""
+        self._paused = True
+
+    def resume(self):
+        """Resume plate processing after a pause."""
+        self._paused = False
 
     def on_plate_sorted(self, bin_num: int):
         """Called from SerialReaderThread signal when PLATE_IN_BIN:N arrives."""
@@ -727,6 +860,13 @@ class PipelineThread(QThread):
         self.sorted_signal.emit(job)
 
     def run(self):
+        """Outer loop: call _process_one_plate() continuously until stop() is called.
+
+        Exceptions inside _process_one_plate are caught here so a single
+        classification failure does not kill the entire pipeline session.
+        The 2 s sleep on error prevents rapid-fire retries if something is
+        persistently broken (e.g. serial disconnected mid-run).
+        """
         while self.running:
             if self._paused:
                 self.msleep(200); continue
@@ -739,6 +879,20 @@ class PipelineThread(QThread):
         print("PipelineThread stopped")
 
     def _process_one_plate(self):
+        """Run one full classify-and-assign cycle for a single plate.
+
+        Steps (matching Arduino pipeline doc):
+          ① Wait for SCALE_STOP — Arduino stopped motor, plate is stationary at scale
+          ② Sleep WEIGHT_SETTLE_S (3.5 s), then poll Firebase until weight is stable
+          ③ Flush stale camera frames, capture CAPTURE_FRAMES, majority-vote finger count
+          ④ Map finger + weight to grade class and bin number
+          ⑤ INSERT result into MySQL
+          ⑥ Clear scale_event, send assign:N  (Arduino restarts motor immediately)
+          ⑦ Emit classified_signal → UI table row added
+
+        On any failure (empty plate / weight timeout / YOLO failure / unknown grade):
+          sends assign:0 (skip, restart motor) and emits error_signal instead.
+        """
         self._plate_num += 1
         p = self._plate_num
         print(f"\n{'═'*50}")
@@ -873,6 +1027,12 @@ class PipelineThread(QThread):
         # ── ⑧ Loop back to ① — sort happens automatically ────────
 
     def stop(self):
+        """Signal the pipeline to stop and wait up to 6 s for a clean exit.
+
+        Sets _stop_flag so the WEIGHT_SETTLE_S sleep and waitForStableWeight()
+        return early.  Sets scale_event so scale_event.wait() unblocks immediately
+        if the thread is stuck waiting for the next plate to arrive at the scale.
+        """
         self.running = False
         self._stop_flag.set()
         if self.serial_reader:
@@ -884,11 +1044,24 @@ class PipelineThread(QThread):
 # UI
 # ─────────────────────────────────────────────────────
 def showMsg(title, text):
+    """Display a modal information dialog and block until the user closes it."""
     m = QMessageBox()
     m.setWindowTitle(title); m.setIcon(QMessageBox.Information)
     m.setText(text); m.exec()
 
 class MainWindow(QWidget):
+    """Main application window — owns all threads and coordinates between them.
+
+    Thread ownership:
+      VideoThread        — live camera preview, always running
+      WeightPollerThread — live weight label, always running
+      StartupThread      — one-shot: loads model/firebase/arduino at startup
+      SerialReaderThread — serial read path, exists only while pipeline runs
+      PipelineThread     — classify-and-sort loop, exists only while pipeline runs
+
+    Start button is locked until both startup (model + arduino) AND camera are
+    confirmed ready (_checkReady checks both flags).
+    """
     def __init__(self):
         super().__init__()
         self.ui = uic.loadUi("old/ui/resultUi.ui", self)
@@ -946,10 +1119,17 @@ class MainWindow(QWidget):
         self._startup.start()
 
     def _onCameraReady(self):
+        """Called by VideoThread.ready_signal after the 8-frame camera warm-up succeeds."""
         self._camera_ok = True
         self._checkReady()
 
     def _onStartupReady(self, results: dict):
+        """Called by StartupThread.ready_signal with pass/fail for model/firebase/arduino.
+
+        Blocks the Start button (shows error dialog) if model or arduino failed.
+        Shows a non-fatal warning dialog if Firebase is unavailable so the operator
+        can decide whether to continue without weight sensing.
+        """
         self._startup_results = results
         errors = []
         if not results['model']:
@@ -968,6 +1148,11 @@ class MainWindow(QWidget):
         self._checkReady()
 
     def _checkReady(self):
+        """Enable Start only after BOTH startup and camera are confirmed ready.
+
+        Both _onStartupReady and _onCameraReady call this; whichever completes
+        second will find both flags true and unlock the button.
+        """
         if self._startup_ok and self._camera_ok:
             self.ui.btnStart.setEnabled(True)
             self.ui.btnCheckSw.setEnabled(True)
@@ -975,9 +1160,15 @@ class MainWindow(QWidget):
             print("App ready")
 
     def onClearTable(self):
+        """Clear all rows from the result table without affecting the running pipeline."""
         self.ui.tblResult.setRowCount(0)
 
     def onNext(self):
+        """Manually send 'next:' to force-start the conveyor motor.
+
+        Intended for operator use when the line has stalled (e.g. after an
+        emergency stop) and needs a manual nudge without restarting the full pipeline.
+        """
         if arduino:
             try:
                 arduino.writeSerial("next:")
@@ -986,6 +1177,11 @@ class MainWindow(QWidget):
                 showMsg("Error", f"Failed to send next: {e}")
 
     def onTestServo(self):
+        """Prompt for a bin number and fire the corresponding servo gate via testServo:N.
+
+        The pipeline does not need to be running.  Used during physical setup to
+        verify each gate's open/close angle and timing before a production run.
+        """
         if not arduino:
             showMsg("Test Servo", "Arduino not connected.")
             return
@@ -999,6 +1195,12 @@ class MainWindow(QWidget):
             showMsg("Error", f"Failed to send testServo:{n}: {e}")
 
     def onCheckLimitSw(self):
+        """Send checkLimitSw: and display all 8 switch states in a dialog.
+
+        If the pipeline is running, SerialReaderThread catches the Arduino's 8-line
+        response and routes it via limit_sw_signal.  If not, a LimitSwCheckThread
+        is spawned to temporarily own the serial read path.
+        """
         if not arduino:
             showMsg("Check Switches", "Arduino not connected.")
             return
@@ -1020,6 +1222,11 @@ class MainWindow(QWidget):
             t.start()
 
     def _onLimitSwData(self, lines: list):
+        """Build and show a dialog mapping the 8 raw 'Limit Switch' lines to named locations.
+
+        Arduino uses INPUT_PULLUP so the raw value is 0 = pressed (active), 1 = open.
+        The dialog colour-codes PRESSED red and OPEN green for quick visual scanning.
+        """
         from PyQt5.QtWidgets import QDialog, QVBoxLayout, QGridLayout, QLabel
         from PyQt5.QtCore import Qt
 
@@ -1068,6 +1275,13 @@ class MainWindow(QWidget):
         dlg.exec_()
 
     def onStart(self):
+        """Start the conveyor pipeline.
+
+        Creates SerialReaderThread (which now owns serial reads), clears any stale
+        scale_event, sends 'next:' to start the motor, then launches PipelineThread.
+        scale_event is cleared BEFORE 'next:' so the first SCALE_STOP produced
+        after the motor starts is not lost to a stale set from a previous session.
+        """
         if not firebase_connected:
             if QMessageBox.question(self, "Firebase?",
                 "Firebase not connected. Continue?",
@@ -1095,6 +1309,13 @@ class MainWindow(QWidget):
         self.setWindowTitle("Banana Sorter — Running")
 
     def _startPipeline(self, farm: str):
+        """Instantiate and wire up PipelineThread and SerialReaderThread signal connections.
+
+        plate_sorted_signal from SerialReaderThread is connected to
+        on_plate_sorted on PipelineThread via a queued connection — Qt auto-queues
+        cross-thread signals, so the FIFO dequeue on _active_jobs always runs on
+        the main thread while PipelineThread.run() may be appending concurrently.
+        """
         self.pipeline_thread = PipelineThread(
             arduino, self.video_thread, farm, self.serial_reader)
         self.pipeline_thread.classified_signal.connect(self._onClassified)
@@ -1108,6 +1329,12 @@ class MainWindow(QWidget):
         print("Pipeline started")
 
     def onStop(self):
+        """Stop the pipeline and send motorStop: to halt the Arduino immediately.
+
+        Stops PipelineThread first (which unblocks any blocking wait via _stop_flag),
+        then SerialReaderThread.  motorStop: on the Arduino halts the motor and clears
+        all job slots so no servo fires unexpectedly after the operator restarts.
+        """
         for t in (self.pipeline_thread, self.serial_reader):
             if t: t.stop()
         self.pipeline_thread = self.serial_reader = None
@@ -1123,6 +1350,12 @@ class MainWindow(QWidget):
         print("Pipeline stopped")
 
     def closeEvent(self, event):
+        """Gracefully stop all threads before the window closes.
+
+        Stops pipeline + serial reader first, then video and weight poller.
+        Order matters: pipeline may reference video_thread in its final iteration,
+        so video must not be stopped before the pipeline is fully joined.
+        """
         self.onStop()
         if self.video_thread:
             self.video_thread.stop()
@@ -1133,12 +1366,14 @@ class MainWindow(QWidget):
         event.accept()
 
     def _onWeightUpdate(self, w: float):
+        """Update the live weight label from WeightPollerThread.  -1.0 means no reading."""
         if w < 0:
             self._weight_label.setText("Weight: -- g")
         else:
             self._weight_label.setText(f"Weight: {w:.1f} g")
 
     def _showFrame(self, frame):
+        """Convert a BGR numpy frame from VideoThread to QPixmap and display it in lblImg."""
         try:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
@@ -1148,6 +1383,13 @@ class MainWindow(QWidget):
             print(f"Frame display error: {e}")
 
     def _onClassified(self, job):
+        """Handle classified_signal from PipelineThread — add a result row to the table.
+
+        Reject rows (bin=0: empty plate, detection failure, unknown grade) are
+        highlighted red so operators can spot problems at a glance.  Weight is
+        displayed as '-' when it's -1 (no banana / sensor failure).
+        If an annotated capture image exists it replaces the live camera preview.
+        """
         if job.get("img") and os.path.exists(job["img"]):
             qi = QImage(job["img"])
             if not qi.isNull():
@@ -1183,6 +1425,11 @@ class MainWindow(QWidget):
                 f"Sorter — plate#{job['plate']} → {job['cls']} — skipped")
 
     def _onSorted(self, job):
+        """Handle sorted_signal — fired when Arduino sends PLATE_IN_BIN:N (physical confirmation).
+
+        Updates the window title to show the confirmed sort.  This is the final
+        step of a plate's lifecycle: plate arrived → weighed → classified → sorted.
+        """
         print(f"UI: ✓ Sorted plate#{job['plate']} {job['cls']}"
               f" → bin:{job['bin']}")
         self.setWindowTitle(
@@ -1190,6 +1437,7 @@ class MainWindow(QWidget):
             f" {job['cls']} → bin:{job['bin']}")
 
     def _onError(self, msg):
+        """Handle error_signal from PipelineThread — log and show truncated message in title bar."""
         print(f"[ERROR] {msg}")
         self.setWindowTitle(f"Sorter — ⚠ {msg[:70]}")
 
